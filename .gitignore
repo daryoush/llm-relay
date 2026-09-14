@@ -1,0 +1,7 @@
+# local config may contain the shared token — never commit it
+server/config.json
+
+__pycache__/
+*.pyc
+.DS_Store
+*.crswap
