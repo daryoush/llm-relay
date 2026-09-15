@@ -22,7 +22,13 @@ async function extractAndSend(tabId) {
   try {
     resp = await chrome.tabs.sendMessage(tabId, { type: "llr-extract" });
   } catch {
-    return { ok: false, error: "no content script here (unsupported site?)" };
+    // tab was opened before the extension was loaded/reloaded — inject and retry
+    try {
+      await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+      resp = await chrome.tabs.sendMessage(tabId, { type: "llr-extract" });
+    } catch {
+      return { ok: false, error: "no content script here (unsupported site?)" };
+    }
   }
   if (!resp?.ok) return { ok: false, error: resp?.error || "no reply found" };
   try {

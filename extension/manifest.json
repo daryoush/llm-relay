@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "description": "Grabs the newest assistant reply on ChatGPT, Claude, Gemini, DeepSeek, Kimi, Qwen and z.ai, and POSTs it to your local relay server.",
 
-  "permissions": ["storage", "contextMenus"],
+  "permissions": ["storage", "contextMenus", "scripting"],
   "host_permissions": [
     "http://127.0.0.1/*",
     "http://localhost/*",

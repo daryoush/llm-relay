@@ -20,8 +20,14 @@ document.getElementById("send").onclick = async () => {
   try {
     resp = await chrome.tabs.sendMessage(tab.id, { type: "llr-extract" });
   } catch {
-    status.textContent = "⚠️ no content script on this page";
-    return;
+    // tab was opened before the extension was loaded/reloaded — inject and retry
+    try {
+      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] });
+      resp = await chrome.tabs.sendMessage(tab.id, { type: "llr-extract" });
+    } catch (e) {
+      status.textContent = "⚠️ can't run here: " + (e.message || "unsupported page");
+      return;
+    }
   }
   if (!resp?.ok) { status.textContent = "⚠️ " + (resp?.error || "no reply"); return; }
 
