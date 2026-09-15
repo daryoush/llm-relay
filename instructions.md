@@ -24,8 +24,8 @@ llm-relay/
 ## 1 · Scaffold
 
 ```bash
-mkdir -p llm-relay/extension llm-relay/server
-cd llm-relay
+# mkdir -p llm-relay/extension llm-relay/server
+# cd llm-relay
 
 cat > .gitignore << 'EOF'
 # local config may contain the shared token — never commit it

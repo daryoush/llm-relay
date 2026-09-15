@@ -58,3 +58,19 @@ tokens never get committed.
 Change the manifest background section to scripts and add gecko id
 (see git history / issue tracker for the snippet), or just use a
 Chromium-based browser.
+
+## How to install the plugin
+The extension isn't from a store — you load it directly from the folder (this is called "load unpacked" and works in Chrome, Edge, Brave, and other Chromium browsers).
+
+Install in Chrome / Edge / Brave
+Open the extensions page — type this in your address bar:
+Chrome: chrome://extensions
+Edge: edge://extensions
+Enable Developer mode — toggle switch, top-right corner.
+Click Load unpacked (top-left).
+In the file picker, select the extension/ folder of the project — the folder containing manifest.json, not the repo root:
+text
+
+llm-relay/extension/     ← select THIS
+Done — "LLM Relay — send last reply" now appears in the list.
+Tip: click the puzzle-piece icon in the toolbar and pin 🔒 LLM Relay so its icon is always visible.

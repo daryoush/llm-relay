@@ -1,0 +1,64 @@
+{
+  "manifest_version": 3,
+  "name": "LLM Relay — send last reply",
+  "version": "1.0.0",
+  "description": "Grabs the newest assistant reply on ChatGPT, Claude, Gemini, DeepSeek, Kimi, Qwen and z.ai, and POSTs it to your local relay server.",
+
+  "permissions": ["storage", "contextMenus"],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "http://localhost/*",
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*",
+    "https://claude.ai/*",
+    "https://gemini.google.com/*",
+    "https://chat.deepseek.com/*",
+    "https://kimi.moonshot.cn/*",
+    "https://kimi.com/*",
+    "https://www.kimi.com/*",
+    "https://kimi.ai/*",
+    "https://chat.qwen.ai/*",
+    "https://tongyi.aliyun.com/*",
+    "https://www.tongyi.com/*",
+    "https://chat.z.ai/*",
+    "https://www.z.ai/*"
+  ],
+
+  "background": { "service_worker": "background.js" },
+
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Send last LLM reply"
+  },
+
+  "options_ui": { "page": "options.html", "open_in_tab": true },
+
+  "commands": {
+    "send-last-reply": {
+      "suggested_key": { "default": "Alt+Shift+S" },
+      "description": "Send the last LLM reply to the relay server"
+    }
+  },
+
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*",
+        "https://claude.ai/*",
+        "https://gemini.google.com/*",
+        "https://chat.deepseek.com/*",
+        "https://kimi.moonshot.cn/*",
+        "https://kimi.com/*",
+        "https://www.kimi.com/*",
+        "https://chat.qwen.ai/*",
+        "https://tongyi.aliyun.com/*",
+        "https://www.tongyi.com/*",
+        "https://chat.z.ai/*",
+        "https://www.z.ai/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
