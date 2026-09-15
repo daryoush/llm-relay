@@ -1,373 +1,311 @@
+Yes — the extension can inject its own **⇪ button into each message's action bar**, right next to copy/retry, and clicking it sends *that specific reply* (not just the newest one). Two realities shape the implementation:
 
+1. **Chat UIs re-render constantly** (React replaces DOM nodes, especially during streaming). Any button we add can be wiped at any moment — so we run a `MutationObserver` that re-injects as needed.
+2. **Every site builds its toolbar differently**, so the code finds the toolbar heuristically (nearest button-row after the message). If it can't find one, it falls back to a small ⇪ button in the message's top-right corner on hover. Either way the text extraction and sending logic is identical.
 
-```bash
+Only the content script changes — manifest, background, popup, server all stay as they are.
 
-cat > server-clj/src/llm_relay/server.clj << 'CLOJEOF'
-(ns llm-relay.server
-  "LLM Relay server — Clojure edition.
-
-   Protocol (same as the Python server):
-     POST /send  {\"text\": \"...\", \"source\": \"chatgpt.com\"}
-     POST /mode  {\"mode\": \"active\" | \"default\"}   (persisted to config.json)
-     GET  /mode  -> current mode
-
-   Modes:
-     default  print the raw text (plain echo)
-     active   render the text as markdown (ANSI) in the terminal; fenced
-              bash code blocks are displayed, then you are asked whether
-              to execute each one. EOF / anything unrecognized = no."
-  (:require [clojure.java.io :as io]
-            [clojure.string  :as str]
-            [clojure.data.json :as json]
-            [ring.adapter.jetty :as jetty]))
-
-;; ── config ────────────────────────────────────────────────────────────
-
-(def defaults
-  {:host            "127.0.0.1"
-   :port            8765
-   :token           ""            ; requests must send X-Relay-Token when set
-   :mode            "default"     ; "default" | "active"
-   :exec-timeout-ms 60000
-   :max-length      200000})
-
-(def config-file
-  (io/file (or (System/getProperty "llm-relay.config") "config.json")))
-
-(def config (atom defaults))
-
-(defn- ->long [d v]
-  (cond (number? v) (long v)
-        (string? v) (or (try (Long/parseLong v) (catch Exception _ nil)) d)
-        :else d))
-
-(defn- save-config! []
-  (spit config-file (with-out-str (json/pprint @config)) :encoding "UTF-8"))
-
-(defn- load-config! []
-  (if (.exists config-file)
-    (try
-      (reset! config (merge defaults
-                            (json/read-str (slurp config-file :encoding "UTF-8")
-                                           :key-fn keyword)))
-      (catch Exception e
-        (binding [*out* *err*]
-          (println "[config] could not read" (str config-file) "—" (ex-message e)))))
-    (save-config!)))
-
-;; ── ANSI helpers (colors only when stdout is a real terminal) ─────────
-
-(def ^:private ansi?
-  (boolean (and (System/console)
-                (str/blank? (or (System/getenv "NO_COLOR") "")))))
-
-(defn- c [code s] (if ansi? (str "\u001b[" code "m" s "\u001b[0m") s))
-(def ^:private b     #(c "1" %))    ; bold
-(def ^:private dim   #(c "2" %))
-(def ^:private ital  #(c "3" %))
-(def ^:private red    #(c "31" %))
-(def ^:private green  #(c "32" %))
-(def ^:private yellow #(c "33" %))
-(def ^:private cyan   #(c "36" %))
-
-;; ── markdown ──────────────────────────────────────────────────────────
-
-;; The markdown fence (three backticks) is BUILT at runtime instead of written
-;; literally, so this source file contains no triple-backtick sequence that a
-;; markdown renderer could ever confuse with a code-fence boundary.
-(def ^:private fence (apply str (repeat 3 (char 96))))
-
-(def ^:private fence-re
-  (re-pattern (str fence "([^\\n\\r]*)\\r?\\n([\\s\\S]*?)" fence)))
-
-(defn- split-segments
-  "Split text into ordered {:kind :text|:code :lang ... :text ...} segments.
-   A fence without a closing fence marker stays part of the surrounding text."
-  [text]
-  (let [m (re-matcher fence-re text)]
-    (loop [segs [] end 0]
-      (if (.find m)
-        (let [lang (first (str/split (str/trim (str (.group m 1))) #"\s+"))
-              pre  (subs text end (.start m))
-              segs (cond-> segs
-                     (not (str/blank? pre)) (conj {:kind :text :text pre})
-                     true                   (conj {:kind :code
-                                                   :lang (str/lower-case lang)
-                                                   :text (.group m 2)}))]
-          (recur segs (.end m)))
-        (let [tail (subs text end)]
-          (cond-> segs
-            (not (str/blank? tail)) (conj {:kind :text :text tail})))))))
-
-(defn- fmt-inline [s]
-  (str/join
-   (for [[_m code txt] (re-seq #"(`[^`\n]+`)|([^`]+)" s)]
-     (if code
-       (cyan code)
-       (-> txt
-           (str/replace #"\*\*([^*\n]+)\*\*" #(b (second %)))
-           (str/replace #"__([^_\n]+)__"    #(b (second %)))
-           (str/replace #"(?<![\w*])\*([^*\n]+?)\*(?![\w*])" #(ital (second %)))
-           (str/replace #"\[([^\]\n]+)\]\(([^)\n]+)\)"
-                        (fn [[_ label href]] (str label " " (dim (str "⟨" href "⟩"))))))))))
-
-(defn- fmt-text [s]
-  (->> (str/split-lines s)
-       (map (fn [line]
-              (cond
-                (re-find #"\A\s{0,3}#{1,6}\s" line)     (b line)
-                (re-find #"\A\s{0,3}>\s?" line)         (ital (dim line))
-                (re-find #"\A\s*[-*+]\s" line)          (str/replace-first line #"\A(\s*)[-*+]\s+" "$1• ")
-                (re-find #"\A\s*([-*_]\s*){3,}\z" line) (dim (apply str (repeat 64 "─")))
-                :else (fmt-inline line))))
-       (str/join "\n")))
-
-(defn- render-code [{:keys [lang text]}]
-  (let [lines (str/split-lines (str/trimr text))
-        head  (str (b (if (str/blank? lang) "code" lang)) " " (dim "────"))
-        body  (map #(str (dim "│ ") (cyan %)) lines)]
-    (str/join "\n" (concat [head] body [(dim "╰────")]))))
-
-;; ── bash execution ────────────────────────────────────────────────────
-
-(defn- run-bash [script timeout-ms]
-  (try
-    (let [p (.start (ProcessBuilder. ^java.util.List ["bash" "-c" script]))]
-      (.close (.getOutputStream p))                 ; scripts reading stdin see EOF
-      (let [out (future (slurp (.getInputStream p)))
-            err (future (slurp (.getErrorStream p)))]
-        (if (.waitFor p timeout-ms java.util.concurrent.TimeUnit/MILLISECONDS)
-          {:exit (.exitValue p) :out @out :err @err}
-          (do (.destroyForcibly p)
-              {:exit :timeout
-               :out (deref out 1000 "")
-               :err (deref err 1000 "")}))))
-    (catch Exception e
-      {:exit :error :out "" :err (or (ex-message e) (str e))})))
-
-(def ^:private prompt-lock (Object.))
-
-(defn- ask!
-  "Returns :yes | :no | :all | :skip-all.  EOF or junk answer -> :no (safe)."
-  []
-  (print (b "  ▶ Execute this block?  "))
-  (print (dim "[y]es  [n]o (display only)  [a]ll remaining  [q]uit: "))
-  (flush)
-  (case (some-> (read-line) str/trim str/lower-case)
-    "y" :yes
-    "n" :no
-    "a" :all
-    "q" :skip-all
-    :no))
-
-(defn- print-out [label s]
-  (when-not (str/blank? s)
-    (println (dim (str "  " label)))
-    (doseq [l (str/split-lines s)]
-      (println (str "  " l)))))
-
-(defn- execute-block [{:keys [text]} cfg]
-  (println (yellow "  ⏳ running…"))
-  (let [{:keys [exit out err]} (run-bash text (->long 60000 (:exec-timeout-ms cfg)))]
-    (case exit
-      :timeout (println (red "  ⏱ timed out — process killed"))
-      :error   (println (red "  ✗ could not start bash:") (str err))
-      (do
-        (println (if (zero? exit)
-                   (green (str "  ✓ exit " exit))
-                   (red   (str "  ✗ exit " exit))))
-        (print-out "stdout:" out)
-        (print-out "stderr:" err)))))
-
-;; ── the two modes ─────────────────────────────────────────────────────
-
-(defn- process-default [text source]
-  (let [bar (apply str (repeat 66 "="))]
-    (println)
-    (println bar)
-    (println "📩 from" source "·" (count text) "chars")
-    (println bar)
-    (println text)
-    (println bar)))
-
-(def ^:private bash-langs #{"bash" "sh" "shell" "zsh"})
-
-(defn- process-active [text cfg]
-  (println)
-  (println (dim (str "╭── markdown · " (count text) " chars " (apply str (repeat 30 "─")))))
-  (loop [segs (split-segments text) policy :ask]
-    (when-let [seg (first segs)]
-      (case (:kind seg)
-        :text (do (println (fmt-text (:text seg)))
-                  (println)
-                  (recur (rest segs) policy))
-        :code (let [bash?  (contains? bash-langs (:lang seg))
-                    choice (cond
-                             (not bash?)          :display
-                             (= policy :all)      :all
-                             (= policy :skip-all) :skip-all
-                             :else                (ask!))]
-                (when (#{:yes :all} choice)
-                  (execute-block seg cfg))
-                (when bash? (println))
-                (recur (rest segs)
-                       (cond (= choice :all)      :all
-                             (= choice :skip-all) :skip-all
-                             :else                policy))))))
-  (println (dim (str "╰" (apply str (repeat 60 "─"))))))
-
-;; ── http ──────────────────────────────────────────────────────────────
-
-(defn- json-resp [status m]
-  {:status  status
-   :headers {"Content-Type" "application/json"
-             "Access-Control-Allow-Origin"  "*"
-             "Access-Control-Allow-Methods" "GET, POST, OPTIONS"
-             "Access-Control-Allow-Headers" "Content-Type, X-Relay-Token"}
-   :body    (json/write-str m)})
-
-(defn- no-content []
-  {:status 204
-   :headers {"Access-Control-Allow-Origin"  "*"
-             "Access-Control-Allow-Methods" "GET, POST, OPTIONS"
-             "Access-Control-Allow-Headers" "Content-Type, X-Relay-Token"}
-   :body nil})
-
-(defn- authorized? [req]
-  (let [{:keys [token]} @config]
-    (or (str/blank? token)
-        (= token (get-in req [:headers "x-relay-token"])))))
-
-(defn- read-body [req]
-  (if-let [b (:body req)]
-    (slurp b :encoding "UTF-8")
-    ""))
-
-(defn- parse-payload [raw]
-  (try
-    (let [d (json/read-str raw)]
-      (if (map? d)
-        {:text (str (get d "text")) :source (str (get d "source" "unknown"))}
-        {:text raw :source "unknown"}))
-    (catch Exception _ {:text raw :source "unknown"})))
-
-(defn- handle-send [req]
-  (let [cfg @config
-        {:keys [text source]} (parse-payload (read-body req))
-        text  (str/trim text)
-        limit (:max-length cfg)
-        text  (if (and limit (> (count text) (int limit))) (subs text 0 limit) text)]
-    (cond
-      (str/blank? text)
-      (json-resp 400 {:ok false :error "empty text"})
-
-      :else
-      (do (if (= "active" (:mode cfg))
-            (locking prompt-lock (process-active text cfg))
-            (process-default text source))
-          (flush)
-          (json-resp 200 {:ok true})))))
-
-(defn- handle-mode [req]
-  (case (:request-method req)
-    :get (json-resp 200 {:mode (:mode @config)})
-    :post (let [mode (try (json/read-str (read-body req)) (catch Exception _ nil))]
-            (if (contains? #{"active" "default"} (str mode))
-              (do (swap! config assoc :mode mode)
-                  (save-config!)
-                  (println (str "\n[mode] → " mode))
-                  (flush)
-                  (json-resp 200 {:ok true :mode mode}))
-              (json-resp 400 {:ok false :error "mode must be \"active\" or \"default\""})))
-    :options (no-content)
-    (json-resp 405 {:ok false :error "method not allowed"})))
-
-(defn- clean-path [uri]
-  (let [p (str/replace (first (str/split (or uri "/") #"\?")) #"/+$" "")]
-    (if (str/blank? p) "/" p)))
-
-(defn handler [req]
-  (try
-    (if-not (authorized? req)
-      (json-resp 401 {:ok false :error "missing or bad X-Relay-Token"})
-      (case (clean-path (:uri req))
-        "/send" (case (:request-method req)
-                  :post    (handle-send req)
-                  :options (no-content)
-                  (json-resp 405 {:ok false :error "POST required"}))
-        "/mode" (handle-mode req)
-        (json-resp 404 {:ok false :error (str "unknown path " (:uri req))})))
-    (catch Exception e
-      (json-resp 500 {:ok false :error (str (ex-message e))}))))
-
-;; ── main ──────────────────────────────────────────────────────────────
-
-(defn -main [& _]
-  (load-config!)
-  (let [{:keys [host port mode token exec-timeout-ms]} @config]
-    (println "──────────────────────────────────────────────────────")
-    (println " LLM Relay Server (Clojure)")
-    (println (str "  ->  http://" host ":" port "/send"))
-    (println (str "  mode    : " (if (= "active" mode)
-                                   "ACTIVE — markdown + bash (asks before executing)"
-                                   "default — plain echo")))
-    (println (str "  config  : " (.getAbsolutePath config-file) "  (mode persisted here)"))
-    (println (str "  token   : " (if (str/blank? token) "disabled" "enabled")))
-    (println (str "  timeout : " exec-timeout-ms " ms per bash block"))
-    (println "  switch  : curl -X POST :8765/mode -d '{\"mode\":\"active\"}'")
-    (println "──────────────────────────────────────────────────────")
-    (flush)
-    (jetty/run-jetty #'handler {:host host :port (->long 8765 port)})))
-CLOJEOF
-
-wc -l server-clj/src/llm_relay/server.clj   # sanity: should now be ~330 lines
-```
-
-The functional change is small: the fence is now built at runtime —
-
-```clojure
-(def ^:private fence (apply str (repeat 3 (char 96))))   ; three backticks, built not typed
-(def ^:private fence-re
-  (re-pattern (str fence "([^\\n\\r]*)\\r?\\n([\\s\\S]*?)" fence)))
-```
-
-— producing the identical regex without the literal hazard.
-
-## Syntax-check, then run
+## Replace `extension/content.js`
 
 ```bash
-cd server-clj && clojure -M -e "(require 'llm-relay.server) (println :syntax-ok)" && cd ..
-# prints :syntax-ok if the whole file parses and compiles
+cat > extension/content.js << 'JSEOF'
+"use strict";
 
-make run-clj
+const WRAP_ID = "llr-root";
+
+// ── Per-site rules.
+//    selectors   : how to find assistant message containers (last match = newest)
+//    toolbar     : OPTIONAL exact selector for the per-message action bar.
+//                  Find it with DevTools (inspect the copy/retry icons) and add
+//                  e.g.  toolbar: 'div[class*="actions"]'  — then the heuristic
+//                  below is skipped for that site.
+const SITE_RULES = [
+  {
+    match: h => /(^|\.)chatgpt\.com$/.test(h) || h === "chat.openai.com",
+    selectors: ['[data-message-author-role="assistant"]'],
+  },
+  {
+    match: h => h === "claude.ai",
+    selectors: ['[data-testid="assistant-message"]', ".font-claude-message"],
+  },
+  {
+    match: h => h === "gemini.google.com",
+    selectors: ["model-response .markdown", "model-response message-content", "model-response", "response-container"],
+  },
+  {
+    match: h => h === "chat.deepseek.com",
+    selectors: ["div.ds-markdown", '[class*="ds-markdown"]', ".markdown-body"],
+  },
+  {
+    match: h => /(^|\.)kimi\.com$/.test(h) || h === "kimi.moonshot.cn",
+    selectors: ['[role="assistant"]', '[class*="assistant" i]', '[class*="segment" i]'],
+  },
+  {
+    match: h => h === "chat.qwen.ai" || /(^|\.)(tongyi\.aliyun|tongyi)\.com$/.test(h),
+    selectors: ['[id^="response-content-container"]', ".tongyi-markdown", '[class*="answer" i]'],
+  },
+  {
+    match: h => /(^|\.)z\.ai$/.test(h),
+    selectors: ['[class*="assistant" i]', '[class*="markdown" i]', ".prose"],
+  },
+];
+
+const GENERIC = [   // used only for "send last reply" (hotkey/popup/floating button)
+  '[data-message-author-role="assistant"]',
+  '[role="assistant"]',
+  "article",
+  '[class*="assistant" i]',
+  '[class*="markdown" i]',
+  ".prose",
+];
+
+function siteRule() { return SITE_RULES.find(r => r.match(location.hostname)); }
+
+// ── extraction helpers ────────────────────────────────────────────────
+
+function usable(el) {
+  if (el.closest(`#${WRAP_ID}`)) return false;
+  if (el.closest('[contenteditable="true"], textarea, input')) return false;
+  return !!(el.offsetParent || el.getClientRects().length);
+}
+
+function pickAll(selector) {
+  let nodes;
+  try { nodes = document.querySelectorAll(selector); } catch { return []; }
+  const arr = Array.from(nodes).filter(usable);
+  return arr.filter(el => !arr.some(o => o !== el && o.contains(el))); // outermost only
+}
+
+function lastReply() {
+  for (const sel of [...(siteRule()?.selectors || []), ...GENERIC]) {
+    const arr = pickAll(sel);
+    if (arr.length) return { el: arr[arr.length - 1], via: sel };
+  }
+  return null;
+}
+
+// innerText of a detached clone (buttons/SVGs stripped — including OUR injected ones)
+function elText(el) {
+  const c = el.cloneNode(true);
+  c.querySelectorAll("button, svg, [aria-hidden='true']").forEach(n => n.remove());
+  c.style.cssText = "position:absolute;left:-99999px;top:0;width:800px;";
+  document.body.appendChild(c);
+  const t = (c.innerText || "").trim();
+  c.remove();
+  return t;
+}
+
+function extract() {
+  const r = lastReply();
+  return r ? { text: elText(r.el), via: r.via } : null;
+}
+
+const buildPayload = (text) => ({
+  text,
+  source: location.hostname,
+  url: location.href,
+  ts: new Date().toISOString(),
+});
+
+async function sendText(text, label) {
+  const res = await chrome.runtime
+    .sendMessage({ type: "llr-relay", payload: buildPayload(text) })
+    .catch(e => ({ ok: false, error: e.message }));
+  toast(res?.ok ? `✅ Sent ${label} (${text.length} chars)` : `⚠️ ${res?.error || "failed"}`);
+}
+
+// ── per-message buttons in the site's action bar ──────────────────────
+
+function findToolbar(msg, rule) {
+  // 1) exact selector if the rule provides one
+  if (rule?.toolbar) {
+    for (let el = msg.parentElement, i = 0; el && i < 6; i++, el = el.parentElement) {
+      const t = el.querySelector(rule.toolbar);
+      if (t) return t;
+    }
+  }
+  // 2) heuristic: nearest following sibling (walking up a few levels) that is a
+  //    small button row — but never a sibling that IS/CONTAINS another message
+  const sels = rule?.selectors || [];
+  const hasMsg = n => {
+    try { return sels.some(s => n.matches(s) || n.querySelector(s)); } catch { return false; }
+  };
+  let el = msg;
+  for (let i = 0; i < 5 && el; i++) {
+    let sib = el.nextElementSibling;
+    while (sib) {
+      const n = sib.querySelectorAll("button").length;
+      if (n >= 1 && n <= 12 && !sib.querySelector("pre") && !hasMsg(sib)) return sib;
+      sib = sib.nextElementSibling;
+    }
+    el = el.parentElement;
+  }
+  return null;
+}
+
+function stop(e) { e.preventDefault(); e.stopPropagation(); }
+
+function makeToolbarButton(msg, bar) {
+  const ref = bar.querySelector("button");
+  const b = ref ? ref.cloneNode(false) : document.createElement("button");
+  b.type = "button";
+  b.textContent = "⇪";
+  b.title = "Send this reply to relay server";
+  b.setAttribute("aria-label", b.title);
+  b.setAttribute("data-llr-btn", "1");
+  if (!ref) Object.assign(b.style, {
+    border: "0", background: "transparent", cursor: "pointer",
+    font: "14px system-ui", padding: "4px 6px", opacity: "0.85",
+  });
+  b.addEventListener("click", (e) => {
+    stop(e);
+    const target = msg.isConnected ? msg : lastReply()?.el;
+    if (target) sendText(elText(target), "this reply");
+  }, true); // capture: run before the site's own delegated handlers
+  return b;
+}
+
+function attachCornerButton(msg) {
+  if (getComputedStyle(msg).position === "static") msg.style.position = "relative";
+  const b = document.createElement("button");
+  b.type = "button";
+  b.textContent = "⇪";
+  b.title = "Send this reply to relay server";
+  b.setAttribute("data-llr-btn", "1");
+  Object.assign(b.style, {
+    position: "absolute", top: "4px", right: "4px", zIndex: 5,
+    opacity: "0", transition: "opacity .15s", border: "0", borderRadius: "6px",
+    padding: "4px 8px", cursor: "pointer",
+    background: "#111827", color: "#fff", font: "12px system-ui",
+  });
+  msg.addEventListener("mouseenter", () => (b.style.opacity = "0.9"));
+  msg.addEventListener("mouseleave", () => (b.style.opacity = "0"));
+  b.addEventListener("click", (e) => { stop(e); sendText(elText(msg), "this reply"); }, true);
+  msg.appendChild(b);
+}
+
+function ensureButton(msg, rule) {
+  const bar = findToolbar(msg, rule);
+  if (bar && !bar.closest(`#${WRAP_ID}`)) {
+    if (!bar.querySelector("[data-llr-btn]")) bar.appendChild(makeToolbarButton(msg, bar));
+  } else if (!msg.querySelector(":scope > [data-llr-btn]")) {
+    attachCornerButton(msg);
+  }
+}
+
+// chat pages mutate constantly (streaming, re-renders) — rescan debounced
+function startObserver() {
+  const rule = siteRule();
+  if (!rule) return;                       // injection only on known sites
+  let t = null;
+  new MutationObserver(() => {
+    clearTimeout(t);
+    t = setTimeout(() => {
+      for (const sel of rule.selectors)
+        for (const msg of pickAll(sel)) ensureButton(msg, rule);
+    }, 300);
+  }).observe(document.body, { childList: true, subtree: true });
+  for (const sel of rule.selectors)
+    for (const msg of pickAll(sel)) ensureButton(msg, rule);
+}
+
+// ── messages from background (hotkey / popup / context menu) ──────────
+
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg?.type === "llr-extract") {
+    const found = extract();
+    if (!found) { sendResponse({ ok: false, error: "no reply found on this page" }); return; }
+    sendResponse({ ok: true, payload: buildPayload(found.text), chars: found.text.length });
+    return;
+  }
+  if (msg?.type === "llr-status") {
+    toast(msg.ok ? `✅ Sent ${msg.chars} chars` : `⚠️ ${msg.error}`);
+  }
+});
+
+// ── floating button (sends the LAST reply, unchanged behavior) ────────
+
+let wrap = null;
+async function syncButton() {
+  const { showButton = true } = await chrome.storage.sync.get({ showButton: true });
+  if (showButton && !wrap) {
+    wrap = document.createElement("div");
+    wrap.id = WRAP_ID;
+    const btn = document.createElement("div");
+    btn.textContent = "⇪ Send last reply";
+    Object.assign(btn.style, {
+      position: "fixed", right: "16px", bottom: "16px", zIndex: 2147483647,
+      padding: "8px 14px", borderRadius: "20px", cursor: "pointer",
+      background: "#111827", color: "#fff", font: "13px system-ui, sans-serif",
+      boxShadow: "0 2px 8px rgba(0,0,0,.35)", opacity: "0.85", userSelect: "none",
+    });
+    btn.addEventListener("click", () => {
+      const found = extract();
+      if (!found) { toast("❌ No reply found on this page"); return; }
+      sendText(found.text, "last reply");
+    });
+    wrap.appendChild(btn);
+    document.body.appendChild(wrap);
+  } else if (!showButton && wrap) {
+    wrap.remove();
+    wrap = null;
+  }
+}
+chrome.storage.onChanged.addListener(syncButton);
+syncButton();
+startObserver();
+
+// ── toast ─────────────────────────────────────────────────────────────
+
+let toastTimer;
+function toast(msgText) {
+  let el = document.getElementById(`${WRAP_ID}-toast`);
+  if (!el) {
+    el = document.createElement("div");
+    el.id = `${WRAP_ID}-toast`;
+    Object.assign(el.style, {
+      position: "fixed", right: "16px", bottom: "56px", zIndex: 2147483647,
+      padding: "8px 12px", borderRadius: "8px", background: "#111827",
+      color: "#fff", font: "13px system-ui, sans-serif", display: "none",
+    });
+    document.body.appendChild(el);
+  }
+  el.textContent = msgText;
+  el.style.display = "block";
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => (el.style.display = "none"), 2500);
+}
+JSEOF
 ```
 
-## Test active mode — without pasting backticks again
-
-The old test curl also contained the fence sequence, so here's a safe equivalent that builds it in Python:
+## Reload & test
 
 ```bash
-python3 - << 'EOF'
-import json, urllib.request
-fence = "`" * 3
-text = ("## Demo\n\nSome **markdown** text.\n\n"
-        + fence + "bash\necho hi from the relay\n" + fence + "\n\nDone.")
-req = urllib.request.Request(
-    "http://127.0.0.1:8765/send",
-    data=json.dumps({"text": text, "source": "curl"}).encode(),
-    headers={"Content-Type": "application/json"})
-print(urllib.request.urlopen(req).read().decode())
-EOF
+# no build step — just reload the extension, then refresh a chat page once
 ```
 
-Watch the server console: the markdown renders, the bash block is shown, and you're prompted `[y]es [n]o [a]ll [q]uit` before anything executes.
+1. `chrome://extensions` → **↻ reload** on LLM Relay → refresh the chat tab once.
+2. Open any conversation: every assistant message should now have a **⇪** in its icon row (or top-right corner on hover where the toolbar wasn't found). Click it → toast confirms → the text of **that** message arrives at your server.
+3. Hotkey / popup / floating button still send the newest reply, as before.
 
-## Commit
+Commit:
 
 ```bash
-git add server-clj/src/llm_relay/server.clj
-git commit -m "Build markdown fence at runtime to avoid literal backtick sequences in source"
+git add extension/content.js
+git commit -m "Inject per-message send button into each chat reply's action bar"
 git push
 ```
 
-**Takeaway for the future:** when copying code blocks out of a chat, prefer the block's **copy button** (it grabs raw source) over selecting rendered text — and a file that's suspiciously short (`wc -l`) right after a copy-paste is the tell-tale sign this happened again.
+## How it behaves / notes
+
+- **Correct message, guaranteed:** each button keeps a live reference to its message. Even if the heuristic mis-places a button visually, clicking it sends the reply it was created for. If the site has since replaced that message node, it falls back to the newest reply.
+- **Your own buttons can't pollute extraction:** `elText` strips all `<button>`/`<svg>` elements from the clone before reading text, so the injected ⇪ never appears in what gets sent — regardless of toolbar or corner placement.
+- **Streaming:** buttons may appear on a message as soon as it starts streaming; text sent mid-stream is whatever is rendered at click time.
+- **Toolbar not found on some site?** You'll see the corner button instead — it works identically. If you want it *inside* the icon row, use the DevTools probing from my previous answer on the copy/retry icons, then add one key to that site's rule in `content.js`:
+  ```js
+  { match: h => h === "chat.deepseek.com",
+    selectors: ["div.ds-markdown"],
+    toolbar: '.ds-markdown--actions' },   // ← your inspected selector
+  ```
+  and reload the extension.
+- **Known-site injection only:** per-message buttons are injected where a `SITE_RULES` entry matches the hostname (your seven LLM sites). Unknown pages keep hotkey/popup/floating-button support with the generic selectors, which are too broad to safely decorate every match.
