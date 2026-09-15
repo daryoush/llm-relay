@@ -1,8 +1,3 @@
-
-
-```bash
-
-cat > server-clj/src/llm_relay/server.clj << 'CLOJEOF'
 (ns llm-relay.server
   "LLM Relay server — Clojure edition.
 
@@ -318,56 +313,3 @@ cat > server-clj/src/llm_relay/server.clj << 'CLOJEOF'
     (println "──────────────────────────────────────────────────────")
     (flush)
     (jetty/run-jetty #'handler {:host host :port (->long 8765 port)})))
-CLOJEOF
-
-wc -l server-clj/src/llm_relay/server.clj   # sanity: should now be ~330 lines
-```
-
-The functional change is small: the fence is now built at runtime —
-
-```clojure
-(def ^:private fence (apply str (repeat 3 (char 96))))   ; three backticks, built not typed
-(def ^:private fence-re
-  (re-pattern (str fence "([^\\n\\r]*)\\r?\\n([\\s\\S]*?)" fence)))
-```
-
-— producing the identical regex without the literal hazard.
-
-## Syntax-check, then run
-
-```bash
-cd server-clj && clojure -M -e "(require 'llm-relay.server) (println :syntax-ok)" && cd ..
-# prints :syntax-ok if the whole file parses and compiles
-
-make run-clj
-```
-
-## Test active mode — without pasting backticks again
-
-The old test curl also contained the fence sequence, so here's a safe equivalent that builds it in Python:
-
-```bash
-python3 - << 'EOF'
-import json, urllib.request
-fence = "`" * 3
-text = ("## Demo\n\nSome **markdown** text.\n\n"
-        + fence + "bash\necho hi from the relay\n" + fence + "\n\nDone.")
-req = urllib.request.Request(
-    "http://127.0.0.1:8765/send",
-    data=json.dumps({"text": text, "source": "curl"}).encode(),
-    headers={"Content-Type": "application/json"})
-print(urllib.request.urlopen(req).read().decode())
-EOF
-```
-
-Watch the server console: the markdown renders, the bash block is shown, and you're prompted `[y]es [n]o [a]ll [q]uit` before anything executes.
-
-## Commit
-
-```bash
-git add server-clj/src/llm_relay/server.clj
-git commit -m "Build markdown fence at runtime to avoid literal backtick sequences in source"
-git push
-```
-
-**Takeaway for the future:** when copying code blocks out of a chat, prefer the block's **copy button** (it grabs raw source) over selecting rendered text — and a file that's suspiciously short (`wc -l`) right after a copy-paste is the tell-tale sign this happened again.

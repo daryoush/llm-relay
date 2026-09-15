@@ -1,0 +1,6 @@
+{"host":"127.0.0.1",
+ "port":8765,
+ "token":"",
+ "mode":"default",
+ "exec-timeout-ms":60000,
+ "max-length":200000}
