@@ -43,7 +43,7 @@
       "suggested_key": {
         "default": "Alt+Shift+S"
       },
-      "description": "Send the last LLM reply to the relay server"
+      "description": "Send clipboard content to the relay server"
     }
   },
   "content_scripts": [

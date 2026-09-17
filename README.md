@@ -34,8 +34,12 @@ assistant message in DevTools and add a selector.
 Then in Chrome/Edge: chrome://extensions → Developer mode → Load unpacked →
 select the `extension/` folder.
 
-Send the last reply via: toolbar popup · Alt+Shift+S (configurable at
-chrome://extensions/shortcuts) · right-click menu · floating button.
+Clipboard workflow (v1.3.0+): copy the reply you want (the site's copy
+button preserves raw markdown incl. code fences), then send via toolbar
+popup (with preview) · floating "Send clipboard" button · Alt+Shift+S ·
+right-click menu. The clipboard content is relayed verbatim — the
+extension performs no extraction or filtering; the server owns all
+interpretation.
 
 ## Configuration
 

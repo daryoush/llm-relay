@@ -4,6 +4,16 @@ Version: 1.1 · See README.md for installation; this document explains how the
 system works, why it is built this way, and where to make changes. It is
 written to serve as complete context for a new user *or* an LLM agent.
 
+## 0. Current state (v1.3.0)
+
+The extension is a CLIPBOARD PIPE: the user copies the text they want
+(the site's copy button yields raw markdown with code fences), then
+triggers a send (popup / floating button / hotkey / context menu). The
+clipboard content is relayed verbatim. DOM-based extraction of "the last
+reply" was removed after field testing showed rendered page text does
+not contain fence markers on several sites. See §5 for historical
+extraction details (superseded), §12 for the investigation record.
+
 ## 1. Purpose
 
 LLM Relay captures LLM chat replies in the browser and hands them to a small
