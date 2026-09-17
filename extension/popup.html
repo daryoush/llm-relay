@@ -3,7 +3,10 @@
 <head>
   <meta charset="utf-8">
   <style>
-    body { font: 13px system-ui, sans-serif; width: 240px; margin: 0; padding: 12px; }
+    body { font: 13px system-ui, sans-serif; width: 280px; margin: 0; padding: 12px; }
+    #prev { font-size: 11px; color: #374151; background: #f3f4f6; border-radius: 6px;
+            padding: 6px 8px; margin-bottom: 8px; max-height: 90px; overflow: auto;
+            word-break: break-all; white-space: pre-wrap; }
     button { width: 100%; padding: 8px; border: 0; border-radius: 8px;
              background: #111827; color: #fff; cursor: pointer; }
     button:hover { background: #1f2937; }
@@ -13,7 +16,8 @@
   </style>
 </head>
 <body>
-  <button id="send">⇪ Send last LLM reply</button>
+  <div id="prev">reading clipboard…</div>
+  <button id="send">⇪ Send clipboard to server</button>
   <div id="status"></div>
   <div class="url" id="srv"></div>
   <a href="#" id="opts">Settings…</a>

@@ -1,12 +1,13 @@
 {
   "manifest_version": 3,
   "name": "LLM Relay \u2014 send last reply",
-  "version": "1.0.0",
+  "version": "1.3.0",
   "description": "Grabs the newest assistant reply on ChatGPT, Claude, Gemini, DeepSeek, Kimi, Qwen and z.ai, and POSTs it to your local relay server.",
   "permissions": [
     "storage",
     "contextMenus",
-    "scripting"
+    "scripting",
+    "clipboardRead"
   ],
   "host_permissions": [
     "http://127.0.0.1/*",
