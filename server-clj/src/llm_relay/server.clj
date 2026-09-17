@@ -37,8 +37,20 @@
    :exec-timeout-ms 60000
    :max-length      200000})
 
+(def ^:private home-dir
+  "The HOME of this server instance: the directory the process was
+   LAUNCHED from. config.json is read/created here and relative
+   :save-path values resolve against it. Override with LLM_RELAY_HOME
+   (env) or -Dllm-relay.home=... (system property)."
+  (.getAbsoluteFile
+   (io/file (or (System/getProperty "llm-relay.home")
+                (System/getenv "LLM_RELAY_HOME")
+                "."))))
+
 (def config-file
-  (io/file (or (System/getProperty "llm-relay.config") "config.json")))
+  (io/file (or (System/getProperty "llm-relay.config")
+               (System/getenv "LLM_RELAY_CONFIG")
+               (io/file home-dir "config.json"))))
 
 (def config (atom defaults))
 
@@ -81,17 +93,14 @@
 
 ;; ── saving (the DEFAULT action) ───────────────────────────────────────
 
-(def ^:private project-root
-  "Parent of the server's working directory — the repo root in a normal
-   clone. Relative :save-path values resolve against it."
-  (or (.getParentFile (.getAbsoluteFile (io/file ".")))
-      (io/file ".")))
-
-(defn- save-path [cfg]
+(defn- save-path
+  "Absolute save target: :save-path as-is when absolute, else resolved
+   against home-dir — the launch directory."
+  [cfg]
   (let [p (str (or (:save-path cfg) "instructions.md"))]
     (if (.isAbsolute (io/file p))
       p
-      (str (io/file project-root p)))))
+      (str (io/file home-dir p)))))
 
 (defn- save-instructions!
   "Default action for every received message: persist the text to
@@ -417,6 +426,7 @@
                                    "active" "ACTIVE — markdown + executable code (asks first)"
                                    "echo"   "echo — plain console output"
                                    "save — write instructions.md (one-line note)")))
+    (println (str "  home    : " (.getAbsolutePath home-dir)))
     (println (str "  saves to: " (save-path @config)
                   (when (true? (:save-append @config)) "  (appending)")
                   (when (false? (:save-on-receive @config)) "  (saving DISABLED)")))

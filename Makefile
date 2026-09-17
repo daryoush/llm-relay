@@ -12,4 +12,4 @@ test:
 		-d '{"text":"hello from make test"}' && echo
 
 run-clj:
-	cd server-clj && clojure -M -m llm-relay.server
+	./bin/relay-clj

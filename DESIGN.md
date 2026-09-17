@@ -309,6 +309,15 @@ defmethods, never editing the core loop:
 -   Config is an atom loaded from config.json at STARTUP (differs from the
     Python server's per-request reload). Hand-editing the file requires a
     restart; changing mode via POST /mode persists immediately.
+-   HOME = the directory the server process is LAUNCHED from. config.json
+    is read/created there and relative :save-path values resolve against
+    it. bin/relay-clj starts the server from any directory (it points the
+    Clojure CLI at the project sources via -Sdeps, so no deps.edn is
+    needed in the launch dir); overrides: LLM_RELAY_HOME and
+    LLM_RELAY_CONFIG env vars, or -Dllm-relay.home / -Dllm-relay.config.
+    make run-clj launches from the repo root, so its home is the repo
+    root. An uberjar (clojure -X:build in server-clj/) removes the CLI
+    dependency entirely: java -jar llm-relay.jar, same home rules.
 -   Keys: host, port, token, mode, save-path, save-append,
     save-on-receive, exec-timeout-ms, max-length.
 
@@ -405,7 +414,8 @@ To customize a language beyond the standard prompt/run flow, add an exact
 
     make run          # Python server (creates config.json on first run)
     make test         # curl POST a test message
-    make run-clj      # Clojure server (same port — run one at a time)
+    make run-clj      # Clojure server from repo root (home = repo root)
+    ./bin/relay-clj   # same server from ANY directory (home = that dir)
 
 Extension: chrome://extensions → Developer mode → Load unpacked → select
 extension/. After editing extension files: reload the card (↻); refreshing

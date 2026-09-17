@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# relay-clj — run the LLM Relay Clojure server from ANY directory.
+#
+# The launch directory becomes the server's HOME: config.json is read or
+# created there, and relative save paths (instructions.md) resolve
+# against it.
+#
+#   relay-clj                                     # home = current directory
+#   LLM_RELAY_CONFIG=/path/config.json relay-clj  # explicit config file
+#   LLM_RELAY_HOME=/path relay-clj                # explicit home directory
+#
+# Requires the clojure CLI on PATH. Dependency versions below must stay
+# in sync with server-clj/deps.edn — update both together.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+exec clojure -Sdeps "{:paths [\"${ROOT}/server-clj/src\"]
+                       :deps {org.clojure/clojure     {:mvn/version \"1.11.3\"}
+                              ring/ring-jetty-adapter {:mvn/version \"1.13.0\"}
+                              org.clojure/data.json   {:mvn/version \"2.5.0\"}}}" \
+       -M -m llm-relay.server "$@"
