@@ -13,3 +13,6 @@ test:
 
 run-clj:
 	./bin/relay-clj
+
+context:
+	./bin/repo-context.sh
