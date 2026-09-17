@@ -2,8 +2,9 @@
   "host": "127.0.0.1",
   "port": 8765,
   "token": "",
-  "command": "save",
+  "command": "print-save",
   "save_path": "instructions.md",
   "save_append": false,
+  "debug_payload": true,
   "max_length": 200000
 }

@@ -12,3 +12,6 @@ instructions.md
 # clojure server may run with any launch directory as its home
 /config.json
 server-clj/llm-relay.jar
+
+# raw request dump (diagnostics)
+server/debug_payload.jsonl
