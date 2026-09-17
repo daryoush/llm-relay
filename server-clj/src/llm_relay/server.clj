@@ -9,8 +9,13 @@
    Modes:
      default  print the raw text (plain echo)
      active   render the text as markdown (ANSI) in the terminal; fenced
-              bash code blocks are displayed, then you are asked whether
-              to execute each one. EOF / anything unrecognized = no."
+              code blocks in EXECUTABLE languages are displayed, then you
+              are asked whether to run each one.
+
+   Active mode is built on two open multimethods:
+     command-for      lang -> command vector or nil (extension point:
+                             one defmethod makes a language executable)
+     process-segment  :text | [:code \"lang\"] -> renders + returns policy"
   (:require [clojure.java.io :as io]
             [clojure.string  :as str]
             [clojure.data.json :as json]
@@ -123,12 +128,16 @@
         body  (map #(str (dim "│ ") (cyan %)) lines)]
     (str/join "\n" (concat [head] body [(dim "╰────")]))))
 
-;; ── bash execution ────────────────────────────────────────────────────
+;; ── execution ─────────────────────────────────────────────────────────
 
-(defn- run-bash [script timeout-ms]
+(defn- run-command
+  "Run cmd (a VECTOR — no shell involved) with stdin closed immediately.
+   Drain stdout/stderr on futures; kill after timeout-ms. Returns
+   {:exit int | :timeout | :error, :out string, :err string}."
+  [cmd timeout-ms]
   (try
-    (let [p (.start (ProcessBuilder. ^java.util.List ["bash" "-c" script]))]
-      (.close (.getOutputStream p))                 ; scripts reading stdin see EOF
+    (let [p (.start (ProcessBuilder. ^java.util.List cmd))]
+      (.close (.getOutputStream p))                 ; stdin readers see EOF
       (let [out (future (slurp (.getInputStream p)))
             err (future (slurp (.getErrorStream p)))]
         (if (.waitFor p timeout-ms java.util.concurrent.TimeUnit/MILLISECONDS)
@@ -161,18 +170,96 @@
     (doseq [l (str/split-lines s)]
       (println (str "  " l)))))
 
-(defn- execute-block [{:keys [text]} cfg]
+;; ──────────────────────────────────────────────────────────────────────
+;; EXTENSION POINT #1 — command-for
+;;
+;; Dispatches on the FENCE LANGUAGE. Return the command VECTOR that runs a
+;; block (the command embeds the script itself — no shell, no quoting), or
+;; nil to keep the language display-only. Adding a language is ONE line:
+;;
+;;   (defmethod command-for "node" [_ _ b] ["node" "-e" (:text b)])
+;;
+;; Any language with a command automatically gets the standard approval
+;; flow (prompt / y-n-a-q / timeout) via process-segment's [:code :default].
+;; ──────────────────────────────────────────────────────────────────────
+
+(defmulti command-for
+  "Command vector to execute a fenced block of the given language, or nil."
+  (fn [lang _block] lang))
+
+(defmethod command-for :default [_ _] nil)
+
+(defmethod command-for "bash"    [_ _ blk] ["bash"    "-c" (:text blk)])
+(defmethod command-for "sh"      [_ _ blk] ["sh"      "-c" (:text blk)])
+(defmethod command-for "zsh"     [_ _ blk] ["zsh"     "-c" (:text blk)])
+(defmethod command-for "shell"   [_ _ blk] ["bash"    "-c" (:text blk)])
+(defmethod command-for "python"  [_ _ blk] ["python3" "-c" (:text blk)])
+(defmethod command-for "python3" [_ _ blk] ["python3" "-c" (:text blk)])
+;; (defmethod command-for "node"  [_ _ blk] ["node"  "-e" (:text blk)])
+;; (defmethod command-for "ruby"  [_ _ blk] ["ruby"  "-e" (:text blk)])
+
+(defn- execute-command! [cmd cfg]
   (println (yellow "  ⏳ running…"))
-  (let [{:keys [exit out err]} (run-bash text (->long 60000 (:exec-timeout-ms cfg)))]
+  (let [{:keys [exit out err]} (run-command cmd (->long 60000 (:exec-timeout-ms cfg)))]
     (case exit
       :timeout (println (red "  ⏱ timed out — process killed"))
-      :error   (println (red "  ✗ could not start bash:") (str err))
+      :error   (println (red "  ✗ could not start " (first cmd) ":") (str err))
       (do
         (println (if (zero? exit)
                    (green (str "  ✓ exit " exit))
                    (red   (str "  ✗ exit " exit))))
         (print-out "stdout:" out)
         (print-out "stderr:" err)))))
+
+(defn- maybe-execute
+  "Standard approval flow for an executable code segment. Returns policy."
+  [seg policy cfg]
+  (let [choice (cond
+                 (= policy :all)      :all
+                 (= policy :skip-all) :skip-all
+                 :else                (ask!))]
+    (when (#{:yes :all} choice)
+      (execute-command! (command-for (:lang seg) seg) cfg))
+    (cond (= choice :all)      :all
+          (= choice :skip-all) :skip-all
+          :else                policy)))
+
+;; ──────────────────────────────────────────────────────────────────────
+;; EXTENSION POINT #2 — process-segment
+;;
+;; Dispatched once per segment of an active-mode message:
+;;   :text             -> prose (rendered as markdown)
+;;   [:code "bash"]    -> exact-language override (wins over :default)
+;;   [:code :default]  -> any other code block: rendered, and if
+;;                        command-for knows the language, run through the
+;;                        standard approval flow
+;; Every method must RETURN the new policy (:ask | :all | :skip-all).
+;; The whole message is just:  (reduce process-segment :ask segments)
+;; ──────────────────────────────────────────────────────────────────────
+
+(defmulti process-segment
+  "Process one active-mode segment; returns the updated policy."
+  (fn [seg _policy _cfg]
+    (if (= :code (:kind seg))
+      [:code (or (:lang seg) "")]
+      (:kind seg))))
+
+(defmethod process-segment :text [seg policy _cfg]
+  (println (fmt-text (:text seg)))
+  (println)
+  policy)
+
+(defmethod process-segment [:code :default] [seg policy cfg]
+  (println (render-code seg))
+  (println)
+  (if (command-for (:lang seg) seg)
+    (maybe-execute seg policy cfg)
+    policy))
+
+;; Example of an exact-language override (takes precedence over :default):
+;;   (defmethod process-segment [:code "python"] [seg policy cfg]
+;;     (println (render-code seg)) (println)
+;;     ...custom behavior, return policy...)
 
 ;; ── the two modes ─────────────────────────────────────────────────────
 
@@ -185,30 +272,12 @@
     (println text)
     (println bar)))
 
-(def ^:private bash-langs #{"bash" "sh" "shell" "zsh"})
-
 (defn- process-active [text cfg]
   (println)
   (println (dim (str "╭── markdown · " (count text) " chars " (apply str (repeat 30 "─")))))
-  (loop [segs (split-segments text) policy :ask]
-    (when-let [seg (first segs)]
-      (case (:kind seg)
-        :text (do (println (fmt-text (:text seg)))
-                  (println)
-                  (recur (rest segs) policy))
-        :code (let [bash?  (contains? bash-langs (:lang seg))
-                    choice (cond
-                             (not bash?)          :display
-                             (= policy :all)      :all
-                             (= policy :skip-all) :skip-all
-                             :else                (ask!))]
-                (when (#{:yes :all} choice)
-                  (execute-block seg cfg))
-                (when bash? (println))
-                (recur (rest segs)
-                       (cond (= choice :all)      :all
-                             (= choice :skip-all) :skip-all
-                             :else                policy))))))
+  (reduce (fn [policy seg] (process-segment seg policy cfg))
+          :ask
+          (split-segments text))
   (println (dim (str "╰" (apply str (repeat 60 "─"))))))
 
 ;; ── http ──────────────────────────────────────────────────────────────
@@ -304,11 +373,11 @@
     (println " LLM Relay Server (Clojure)")
     (println (str "  ->  http://" host ":" port "/send"))
     (println (str "  mode    : " (if (= "active" mode)
-                                   "ACTIVE — markdown + bash (asks before executing)"
+                                   "ACTIVE — markdown + executable code (asks first)"
                                    "default — plain echo")))
     (println (str "  config  : " (.getAbsolutePath config-file) "  (mode persisted here)"))
     (println (str "  token   : " (if (str/blank? token) "disabled" "enabled")))
-    (println (str "  timeout : " exec-timeout-ms " ms per bash block"))
+    (println (str "  timeout : " exec-timeout-ms " ms per code block"))
     (println "  switch  : curl -X POST :8765/mode -d '{\"mode\":\"active\"}'")
     (println "──────────────────────────────────────────────────────")
     (flush)

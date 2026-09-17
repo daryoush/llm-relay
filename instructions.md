@@ -1,426 +1,512 @@
-Here's the design document as a single script to run from the repo root. One deliberate choice: the doc uses **indented code blocks instead of triple-backtick fences throughout**, so the file itself can never trigger the copy-truncation problem we hit earlier — and it's safe to regenerate from this chat any time.
+Good refactor target — the current `bash-langs` set + hardcoded `["bash" "-c" …]` don't scale. I've split active-mode processing into **two open multimethods**:
 
-```bash
-cat > DESIGN.md << 'EOF'
-# LLM Relay — Design Document
+- **`command-for`** — dispatched on the fence language; returns the command *vector* that runs a block, or `nil` = display-only. **This is the extension point: one `defmethod` makes a language executable.** `bash`, `sh`, `shell`, `zsh`, `python`, `python3` ship as examples.
+- **`process-segment`** — dispatched per segment on `:text` / `[:code "lang"]`; each method returns the updated policy, and the message loop is now just a `reduce`. The `[:code :default]` method consults `command-for`, so new languages automatically get the standard y/n/a/q approval flow — unless you add an exact `[:code "lang"]` method to override it.
 
-Version: 1.1 · See README.md for installation; this document explains how the
-system works, why it is built this way, and where to make changes. It is
-written to serve as complete context for a new user *or* an LLM agent.
+Adding Node support is literally:
 
-## 1. Purpose
-
-LLM Relay captures LLM chat replies in the browser and hands them to a small
-local server that runs a configurable action on the text.
-
-Typical uses:
-
--   Display the reply outside the browser (console, desktop window).
--   Pipe LLM output into local scripts, a log file, or the clipboard.
--   (Clojure server, active mode) review and selectively execute bash code
-    blocks contained in the reply, with per-block approval.
-
-Design principles:
-
-1.  Everything stays local: loopback HTTP, no cloud, no telemetry.
-2.  The browser cannot execute anything; only the local server can, and the
-    Clojure server only after an explicit human approval per block.
-3.  Both servers speak the same wire protocol, so the extension is agnostic
-    to which one is running.
-
-## 2. Architecture
-
-    ┌──────────────────────────── Browser (Chromium) ────────────────────────────┐
-    │                                                                            │
-    │  chat page (chatgpt.com / claude.ai / gemini / deepseek / kimi / …)        │
-    │   └─ content.js      extraction · per-message ⇪ buttons · floating button  │
-    │        │             chrome.runtime message passing                        │
-    │        ▼                                                                   │
-    │  background.js (MV3 service worker)                                        │
-    │   └─ fetch POST            ← ALL network I/O happens here                  │
-    └──────────────────────────────┬─────────────────────────────────────────────┘
-                                   │  POST /send  {"text","source","url","ts"}
-                                   ▼
-                        http://127.0.0.1:8765
-             ┌─────────────────────────┴─────────────────────────┐
-             │  server/llm_relay_server.py        (Python)       │  run ONE
-             │  server-clj/src/llm_relay/server.clj (Clojure)    │  of the two
-             └─────────────────────────┬─────────────────────────┘
-                                       ▼
-                               configured command
-        Python: show (echo) · popup window · any shell command
-        Clojure: default = echo · active = markdown render + approved bash exec
-
-## 3. Repository layout
-
-    llm-relay/
-    ├── DESIGN.md                  this document
-    ├── README.md                  quick start
-    ├── Makefile                   run / test / run-clj
-    ├── extension/                 MV3 extension, loaded unpacked
-    │   ├── manifest.json          permissions, matches, shortcut, UI wiring
-    │   ├── background.js          service worker: relay fetch, commands, menus
-    │   ├── content.js             extraction rules, per-message UI, observer
-    │   ├── popup.html/.js         toolbar popup: send + status
-    │   └── options.html/.js       serverUrl / token / showButton + test send
-    ├── server/                    Python implementation (stdlib only)
-    │   ├── llm_relay_server.py
-    │   ├── config.example.json    committed template
-    │   └── config.json            runtime, gitignored (may hold token)
-    └── server-clj/                Clojure implementation (Ring + Jetty)
-        ├── deps.edn
-        ├── src/llm_relay/server.clj
-        └── config.json            runtime, gitignored
-
-## 4. Wire protocol
-
-All endpoints are on 127.0.0.1 (default port 8765). Responses are JSON with
-CORS headers allowing browser origins.
-
-| Method | Path  | Body                          | Success response       | Python | Clojure |
-|--------|-------|-------------------------------|------------------------|--------|---------|
-| POST   | /send | JSON {"text": "...", "source": "host"} or raw text body | 200 {"ok": true} | yes | yes |
-| POST   | /mode | {"mode": "active"} or {"mode": "default"} | 200 {"ok": true, "mode": "..."} | no | yes |
-| GET    | /mode | —                             | 200 {"mode": "..."}    | no     | yes     |
-| OPTIONS| any   | —                             | 204 + CORS headers     | yes    | yes     |
-
-Payload fields sent by the extension:
-
--   text — the extracted reply (required)
--   source — page hostname
--   url — page URL (servers ignore this, kept for logging/future use)
--   ts — ISO timestamp (same)
-
-Errors: 400 empty text · 401 missing/bad X-Relay-Token · 404 unknown path ·
-405 wrong method · 500 server-side exception ({"ok": false, "error": ...}).
-
-Authentication: if the server config sets a non-empty token, every request
-must carry header X-Relay-Token with the same value. Both servers and the
-extension support this.
-
-## 5. Browser extension
-
-### 5.1 Manifest (MV3)
-
--   permissions: storage, contextMenus, scripting
--   host_permissions: http://127.0.0.1/*, http://localhost/*, plus one pattern
-    per supported chat site. Kimi uses wildcard patterns
-    (https://*.kimi.com/*, https://*.kimi.ai/*, https://*.moonshot.cn/*,
-    https://*.moonshot.ai/*) to cover all subdomains and TLD variants.
--   content_scripts: content.js at document_idle on the same site list
--   commands: send-last-reply (suggested Alt+Shift+S; user-configurable at
-    chrome://extensions/shortcuts)
--   action popup + options page
-
-### 5.2 Component responsibilities
-
-| File          | Role                                                              |
-|---------------|-------------------------------------------------------------------|
-| background.js | The only component that talks to the relay server (fetch). Handles the keyboard command and context menu by asking the active tab's content script to extract, then relaying. Answers llr-relay / llr-test messages. |
-| content.js    | Runs inside chat pages. Knows how to find assistant messages (SITE_RULES + GENERIC selectors), renders the floating button and per-message ⇪ buttons, shows toasts. |
-| popup.js      | Manual send button for the active tab + status line + settings link. |
-| options.js    | Persists serverUrl, token, showButton in chrome.storage.sync; sends a test message. |
-
-### 5.3 Internal message contract
-
-| From → To             | type        | payload              | reply                                |
-|-----------------------|-------------|----------------------|--------------------------------------|
-| popup/hotkey/menu → content | llr-extract | —              | {ok, payload, chars} or {ok:false, error} |
-| content → background  | llr-relay   | {payload}            | {ok} or {ok:false, error}            |
-| background → content  | llr-status  | {ok, chars?, error?} | — (content shows toast)              |
-| options → background  | llr-test    | —                    | {ok} or {ok:false, error}            |
-
-Note: llr-extract and llr-status handlers respond synchronously; llr-relay and
-llr-test return true from the listener to keep the message channel open for
-the async sendResponse.
-
-### 5.4 Message extraction (content.js)
-
-1.  Pick the site rule whose match() matches location.hostname (SITE_RULES).
-2.  Candidate selectors = rule.selectors first, then GENERIC fallbacks.
-3.  For each selector: querySelectorAll, filter with usable() — visible
-    (offsetParent or client rects), not inside our own UI wrapper, not inside
-    an editable/textarea/input — then keep only outermost elements (drop
-    nodes contained in another match). The LAST remaining element is the
-    newest reply.
-4.  elText(): clone the element, remove all button/svg/[aria-hidden] nodes
-    (this also removes our own injected buttons), attach the clone offscreen,
-    read innerText, remove the clone. Rendered text is captured, not original
-    markdown (see §12.4).
-5.  Wrap into payload {text, source, url, ts}.
-
-### 5.5 Per-message buttons
-
-Goal: a ⇪ button next to each reply's native copy/retry icons that sends
-THAT specific message (not just the newest).
-
-Placement strategy, in order:
-
-1.  Explicit: rule.toolbars selectors searched in the message's ancestor
-    chain (up to 6 levels), only if the found bar is visible.
-2.  Heuristic: walk up ≤5 ancestor levels; scan following siblings; accept a
-    container with 1–12 buttons, no <pre>, no composer controls, visible,
-    and not containing another message.
-3.  Fallback (always works): a corner button appended to the message itself,
-    positioned absolute top-right, shown on hover.
-
-Robustness details:
-
--   The button keeps a live reference to its message; on click it sends that
-    message's text (falling back to the newest reply if the site replaced
-    the node).
--   Click handler runs in capture phase to precede the site's own delegated
-    handlers; default is prevented.
--   A MutationObserver (debounced 300 ms) re-injects buttons after the site
-    re-renders; ensureButton is idempotent via a data-llr-btn marker.
--   Because elText strips buttons, injected UI can never leak into sent text.
--   Per-message UI is only injected on sites listed in SITE_RULES (the
-    GENERIC selectors are too broad to decorate safely); hotkey/popup/
-    floating button work on any page via GENERIC.
-
-### 5.6 Trigger paths (all converge on the same relay call)
-
-1.  Toolbar popup → "Send last LLM reply"
-2.  Keyboard shortcut (Alt+Shift+S default)
-3.  Page context menu → "Send last LLM reply to server"
-4.  Floating button (bottom-right, sends newest reply)
-5.  Per-message ⇪ button (sends that reply)
-6.  Options page → "Send test message" (fixed text, skips extraction)
-
-### 5.7 On-demand content-script injection
-
-A tab opened BEFORE the extension was installed/reloaded has no content
-script, and messaging it fails. Both background.js and popup.js catch that
-failure, call chrome.scripting.executeScript({files: ["content.js"]}), and
-retry the message once. This requires the "scripting" permission and the
-host being covered by host_permissions — the reason host patterns must list
-every host the user may chat on (wildcards for Kimi). Protected pages
-(chrome://, web store) can never be injected and report a clear error.
-
-## 6. Python server (server/llm_relay_server.py)
-
-Stdlib only (http.server). ThreadingHTTPServer → one thread per request.
-
-Config model:
-
--   config.json lives next to the script; auto-created from defaults on
-    first run (Makefile also copies config.example.json).
--   Re-read on EVERY request — editing the file changes behavior live, no
-    restart. This is intentional; the Clojure server differs here (§7.4).
-
-Request handling (POST /send):
-
-1.  Token check (X-Relay-Token) if configured.
-2.  Body: JSON {"text","source"} preferred; a raw text body is accepted.
-3.  Trim; empty → 400. Truncate to max_length.
-4.  Dispatch on config command:
-    -   "show" (default): print a banner + the text to the server console.
-    -   "popup": run a small tkinter window (via python -c) that displays
-        the text received on stdin.
-    -   anything else: a shell command. If it contains the marker {content},
-        the marker is replaced with shlex.quote(text) (POSIX shells); the
-        command runs with shell=True. Otherwise the text is piped to the
-        command's stdin.
-
-Execution model: spawn() starts the child without waiting; if text is piped,
-a daemon thread writes stdin and closes it. A slow child can never block the
-HTTP response or other requests.
-
-Example commands (config.json "command"):
-
-    "show"                          print to console (default)
-    "popup"                         desktop window
-    "pbcopy" / "wl-copy" / "clip"   clipboard (macOS / Wayland / Windows)
-    "cat >> llm_log.txt"            append to file
-    "python my_script.py {content}" pass text as argument
-
-## 7. Clojure server (server-clj/)
-
-Ring handler on Jetty (deps.edn: ring/ring-jetty-adapter, clojure/data.json).
-Same /send protocol; additionally /mode.
-
-### 7.1 Modes
-
--   default: plain echo — banner, source, char count, raw text. Functionally
-    equivalent to the Python "show" command.
--   active: treats the text as markdown, renders it with ANSI styling in the
-    terminal, and gates bash execution behind an approval prompt.
-
-Mode is switched at runtime via POST /mode and persisted to
-server-clj/config.json. Default mode on first run.
-
-### 7.2 Markdown pipeline (active mode)
-
-1.  split-segments: the text is split into :text and :code segments by the
-    fenced-code regex. The fence token (three backticks) is BUILT at runtime
-    via (apply str (repeat 3 (char 96))) instead of written literally, so the
-    source file contains no fence sequence that markdown tooling could
-    misinterpret (lesson learned — see git history).
-2.  :text segments → fmt-text: headings bold; blockquotes italic/dim;
-    bullets (- * +) → •; horizontal rules dimmed; inline code cyan; bold /
-    italic / link syntax styled inline.
-3.  :code segments → render-code: lang label + vertical-bar prefix, cyan
-    body. All code is DISPLAYED first; nothing runs yet.
-
-### 7.3 Bash execution gate
-
--   A code block qualifies as executable only if its fence language is one
-    of: bash, sh, shell, zsh.
--   For each qualifying block the server prints:
-        ▶ Execute this block?  [y]es  [n]o (display only)  [a]ll remaining  [q]uit
-    The prompt is read from the server terminal's stdin.
--   Policy state machine across the message: answers y/n apply to one block;
-    a sets policy :all (execute every remaining bash block without asking);
-    q sets policy :skip-all (display only from here on).
--   Fail-safe: EOF on stdin (e.g. server run under nohup) or any
-    unrecognized answer = :no (display only).
--   run-bash: ProcessBuilder ["bash" "-c" script]; child stdin closed
-    immediately; stdout/stderr drained on futures; waitFor with
-    exec-timeout-ms (default 60000) then destroyForcibly. Result printed
-    with exit code, stdout, stderr.
--   prompt-lock: concurrent /send requests serialize around the interactive
-    prompt so two conversations cannot interleave questions.
--   ANSI colors are emitted only when stdout is a real console and NO_COLOR
-    is unset.
-
-### 7.4 State & persistence
-
--   Config is an atom loaded from config.json at STARTUP (differs from the
-    Python server's per-request reload). Hand-editing the file requires a
-    restart; changing mode via POST /mode persists immediately.
--   Keys: host, port, token, mode, exec-timeout-ms, max-length.
-
-## 8. Configuration reference
-
-server/config.json (Python):
-
-| key        | default | meaning                                        |
-|------------|---------|------------------------------------------------|
-| host       | 127.0.0.1 | bind address                                  |
-| port       | 8765    | listen port                                     |
-| token      | ""      | require X-Relay-Token when non-empty            |
-| command    | "show"  | show / popup / any shell command                |
-| max_length | 200000  | truncate longer payloads (null/None to disable) |
-
-server-clj/config.json (Clojure):
-
-| key             | default   | meaning                                  |
-|-----------------|-----------|------------------------------------------|
-| host / port     | 127.0.0.1 / 8765 | bind address / port                |
-| token           | ""        | shared secret                            |
-| mode            | "default" | "default" or "active"                    |
-| exec-timeout-ms | 60000     | kill bash blocks after this long          |
-| max-length      | 200000    | payload truncation                        |
-
-Extension (chrome.storage.sync, edited in the options page):
-
-| key        | default                      | meaning                    |
-|------------|------------------------------|----------------------------|
-| serverUrl  | http://127.0.0.1:8765/send   | relay endpoint             |
-| token      | ""                           | must match server token    |
-| showButton | true                         | floating button on pages   |
-
-## 9. Security model
-
--   Servers bind to 127.0.0.1 only. No remote exposure.
--   CORS is open (*) because the client is a browser extension/page; this
-    means ANY page or app on the machine can POST to the port. When a shell
-    command is configured, set a token (server config + extension options).
--   The extension never executes anything; it only sends text.
--   Clojure active mode: human approval is the only execution gate. Approved
-    scripts run locally with full user privileges — review before pressing y.
-    Timeouts kill runaway blocks; EOF fails closed (no execution).
--   config.json files are gitignored precisely because they can hold tokens;
-    config.example.json is the committed, secret-free template.
--   {content} substitution uses shlex.quote (POSIX). On Windows prefer
-    stdin-style commands.
-
-## 10. Extending
-
-Add a supported chat site:
-
-1.  manifest.json: add match patterns to content_scripts.matches AND
-    host_permissions (wildcards https://*.example.com/* cover all
-    subdomains).
-2.  content.js SITE_RULES: add {match: h => ..., selectors: [...],
-    toolbars: [...] (optional)}. Use DevTools to find a stable attribute
-    (data-* / role beats hashed classes).
-3.  Reload the extension; verify extraction via the popup or hotkey.
-
-Change what happens to the text: edit the server config (Python: live;
-Clojure: restart, except mode via /mode).
-
-Add an internal message type: follow the table in §5.3; remember to return
-true from onMessage listeners that respond asynchronously.
-
-## 11. Development & testing workflow
-
-    make run          # Python server (creates config.json on first run)
-    make test         # curl POST a test message
-    make run-clj      # Clojure server (same port — run one at a time)
-
-Extension: chrome://extensions → Developer mode → Load unpacked → select
-extension/. After editing extension files: reload the card (↻); refreshing
-chat tabs is optional thanks to on-demand injection. After editing
-manifest.json (permissions/matches): reload AND refresh open chat tabs.
-
-Mode control (Clojure):
-
-    curl -s http://127.0.0.1:8765/mode
-    curl -s -X POST http://127.0.0.1:8765/mode -d '{"mode":"active"}'
-
-## 12. Design decisions & known limitations
-
-1.  All extension network I/O lives in the background service worker.
-    Extension-origin requests with host_permissions bypass the CORS and
-    mixed-content restrictions an HTTPS chat page would hit posting to
-    http://127.0.0.1.
-2.  Two server implementations, one protocol. The extension does not know
-    or care which is running. Ports collide on 8765 — run one at a time or
-    change config.
-3.  Chat DOMs drift. SITE_RULES carries per-site selectors (data-* and role
-    hooks preferred), GENERIC fallbacks cover unknown/broken sites, and the
-    corner-button fallback depends only on the message element itself.
-4.  Extraction captures RENDERED text (innerText of a cleaned clone), not
-    the original markdown. Consequence: server-side markdown rendering
-    (Clojure active mode) operates on the page's rendering; fenced code
-    blocks survive intact because they render verbatim, but emphasis/nested
-    structures may be normalized.
-5.  Text is captured at click time; sending during streaming captures a
-    partial reply.
-6.  Firefox is not configured out of the box: it needs
-    background.scripts instead of service_worker plus a gecko id in the
-    manifest.
-7.  Unpacked installs require Chrome's Developer mode toggle (an install-
-    time policy only, no runtime effect). Publishing unlisted to the Web
-    Store removes the toggle for other machines.
-8.  Windows: the Clojure server shells out to bash (use WSL or Git Bash);
-    Python {content} quoting is POSIX-only.
-9.  max_length guards both servers against runaway payloads; the extension
-    has no client-side cap.
-10. The two servers deliberately differ on config semantics: Python re-reads
-    config per request (live editing); Clojure loads at startup (mode is
-    the runtime-switchable dimension, persisted via /mode).
-EOF
-
-wc -l DESIGN.md
+```clojure
+(defmethod command-for "node" [_ _ b] ["node" "-e" (:text b)])
 ```
 
-Optional commit:
+## 1 · Rewrite `server.clj`
+
+From the repo root (fence regex still built at runtime — no literal backtick sequences):
 
 ```bash
-git add DESIGN.md
-git commit -m "Add design document covering extension, protocol, and both server implementations"
+cat > server-clj/src/llm_relay/server.clj << 'CLOJEOF'
+(ns llm-relay.server
+  "LLM Relay server — Clojure edition.
+
+   Protocol (same as the Python server):
+     POST /send  {\"text\": \"...\", \"source\": \"chatgpt.com\"}
+     POST /mode  {\"mode\": \"active\" | \"default\"}   (persisted to config.json)
+     GET  /mode  -> current mode
+
+   Modes:
+     default  print the raw text (plain echo)
+     active   render the text as markdown (ANSI) in the terminal; fenced
+              code blocks in EXECUTABLE languages are displayed, then you
+              are asked whether to run each one.
+
+   Active mode is built on two open multimethods:
+     command-for      lang -> command vector or nil (extension point:
+                             one defmethod makes a language executable)
+     process-segment  :text | [:code \"lang\"] -> renders + returns policy"
+  (:require [clojure.java.io :as io]
+            [clojure.string  :as str]
+            [clojure.data.json :as json]
+            [ring.adapter.jetty :as jetty]))
+
+;; ── config ────────────────────────────────────────────────────────────
+
+(def defaults
+  {:host            "127.0.0.1"
+   :port            8765
+   :token           ""            ; requests must send X-Relay-Token when set
+   :mode            "default"     ; "default" | "active"
+   :exec-timeout-ms 60000
+   :max-length      200000})
+
+(def config-file
+  (io/file (or (System/getProperty "llm-relay.config") "config.json")))
+
+(def config (atom defaults))
+
+(defn- ->long [d v]
+  (cond (number? v) (long v)
+        (string? v) (or (try (Long/parseLong v) (catch Exception _ nil)) d)
+        :else d))
+
+(defn- save-config! []
+  (spit config-file (with-out-str (json/pprint @config)) :encoding "UTF-8"))
+
+(defn- load-config! []
+  (if (.exists config-file)
+    (try
+      (reset! config (merge defaults
+                            (json/read-str (slurp config-file :encoding "UTF-8")
+                                           :key-fn keyword)))
+      (catch Exception e
+        (binding [*out* *err*]
+          (println "[config] could not read" (str config-file) "—" (ex-message e)))))
+    (save-config!)))
+
+;; ── ANSI helpers (colors only when stdout is a real terminal) ─────────
+
+(def ^:private ansi?
+  (boolean (and (System/console)
+                (str/blank? (or (System/getenv "NO_COLOR") "")))))
+
+(defn- c [code s] (if ansi? (str "\u001b[" code "m" s "\u001b[0m") s))
+(def ^:private b     #(c "1" %))    ; bold
+(def ^:private dim   #(c "2" %))
+(def ^:private ital  #(c "3" %))
+(def ^:private red    #(c "31" %))
+(def ^:private green  #(c "32" %))
+(def ^:private yellow #(c "33" %))
+(def ^:private cyan   #(c "36" %))
+
+;; ── markdown ──────────────────────────────────────────────────────────
+
+;; The markdown fence (three backticks) is BUILT at runtime instead of written
+;; literally, so this source file contains no triple-backtick sequence that a
+;; markdown renderer could ever confuse with a code-fence boundary.
+(def ^:private fence (apply str (repeat 3 (char 96))))
+
+(def ^:private fence-re
+  (re-pattern (str fence "([^\\n\\r]*)\\r?\\n([\\s\\S]*?)" fence)))
+
+(defn- split-segments
+  "Split text into ordered {:kind :text|:code :lang ... :text ...} segments.
+   A fence without a closing fence marker stays part of the surrounding text."
+  [text]
+  (let [m (re-matcher fence-re text)]
+    (loop [segs [] end 0]
+      (if (.find m)
+        (let [lang (first (str/split (str/trim (str (.group m 1))) #"\s+"))
+              pre  (subs text end (.start m))
+              segs (cond-> segs
+                     (not (str/blank? pre)) (conj {:kind :text :text pre})
+                     true                   (conj {:kind :code
+                                                   :lang (str/lower-case lang)
+                                                   :text (.group m 2)}))]
+          (recur segs (.end m)))
+        (let [tail (subs text end)]
+          (cond-> segs
+            (not (str/blank? tail)) (conj {:kind :text :text tail})))))))
+
+(defn- fmt-inline [s]
+  (str/join
+   (for [[_m code txt] (re-seq #"(`[^`\n]+`)|([^`]+)" s)]
+     (if code
+       (cyan code)
+       (-> txt
+           (str/replace #"\*\*([^*\n]+)\*\*" #(b (second %)))
+           (str/replace #"__([^_\n]+)__"    #(b (second %)))
+           (str/replace #"(?<![\w*])\*([^*\n]+?)\*(?![\w*])" #(ital (second %)))
+           (str/replace #"\[([^\]\n]+)\]\(([^)\n]+)\)"
+                        (fn [[_ label href]] (str label " " (dim (str "⟨" href "⟩"))))))))))
+
+(defn- fmt-text [s]
+  (->> (str/split-lines s)
+       (map (fn [line]
+              (cond
+                (re-find #"\A\s{0,3}#{1,6}\s" line)     (b line)
+                (re-find #"\A\s{0,3}>\s?" line)         (ital (dim line))
+                (re-find #"\A\s*[-*+]\s" line)          (str/replace-first line #"\A(\s*)[-*+]\s+" "$1• ")
+                (re-find #"\A\s*([-*_]\s*){3,}\z" line) (dim (apply str (repeat 64 "─")))
+                :else (fmt-inline line))))
+       (str/join "\n")))
+
+(defn- render-code [{:keys [lang text]}]
+  (let [lines (str/split-lines (str/trimr text))
+        head  (str (b (if (str/blank? lang) "code" lang)) " " (dim "────"))
+        body  (map #(str (dim "│ ") (cyan %)) lines)]
+    (str/join "\n" (concat [head] body [(dim "╰────")]))))
+
+;; ── execution ─────────────────────────────────────────────────────────
+
+(defn- run-command
+  "Run cmd (a VECTOR — no shell involved) with stdin closed immediately.
+   Drain stdout/stderr on futures; kill after timeout-ms. Returns
+   {:exit int | :timeout | :error, :out string, :err string}."
+  [cmd timeout-ms]
+  (try
+    (let [p (.start (ProcessBuilder. ^java.util.List cmd))]
+      (.close (.getOutputStream p))                 ; stdin readers see EOF
+      (let [out (future (slurp (.getInputStream p)))
+            err (future (slurp (.getErrorStream p)))]
+        (if (.waitFor p timeout-ms java.util.concurrent.TimeUnit/MILLISECONDS)
+          {:exit (.exitValue p) :out @out :err @err}
+          (do (.destroyForcibly p)
+              {:exit :timeout
+               :out (deref out 1000 "")
+               :err (deref err 1000 "")}))))
+    (catch Exception e
+      {:exit :error :out "" :err (or (ex-message e) (str e))})))
+
+(def ^:private prompt-lock (Object.))
+
+(defn- ask!
+  "Returns :yes | :no | :all | :skip-all.  EOF or junk answer -> :no (safe)."
+  []
+  (print (b "  ▶ Execute this block?  "))
+  (print (dim "[y]es  [n]o (display only)  [a]ll remaining  [q]uit: "))
+  (flush)
+  (case (some-> (read-line) str/trim str/lower-case)
+    "y" :yes
+    "n" :no
+    "a" :all
+    "q" :skip-all
+    :no))
+
+(defn- print-out [label s]
+  (when-not (str/blank? s)
+    (println (dim (str "  " label)))
+    (doseq [l (str/split-lines s)]
+      (println (str "  " l)))))
+
+;; ──────────────────────────────────────────────────────────────────────
+;; EXTENSION POINT #1 — command-for
+;;
+;; Dispatches on the FENCE LANGUAGE. Return the command VECTOR that runs a
+;; block (the command embeds the script itself — no shell, no quoting), or
+;; nil to keep the language display-only. Adding a language is ONE line:
+;;
+;;   (defmethod command-for "node" [_ _ b] ["node" "-e" (:text b)])
+;;
+;; Any language with a command automatically gets the standard approval
+;; flow (prompt / y-n-a-q / timeout) via process-segment's [:code :default].
+;; ──────────────────────────────────────────────────────────────────────
+
+(defmulti command-for
+  "Command vector to execute a fenced block of the given language, or nil."
+  (fn [lang _block] lang))
+
+(defmethod command-for :default [_ _] nil)
+
+(defmethod command-for "bash"    [_ _ blk] ["bash"    "-c" (:text blk)])
+(defmethod command-for "sh"      [_ _ blk] ["sh"      "-c" (:text blk)])
+(defmethod command-for "zsh"     [_ _ blk] ["zsh"     "-c" (:text blk)])
+(defmethod command-for "shell"   [_ _ blk] ["bash"    "-c" (:text blk)])
+(defmethod command-for "python"  [_ _ blk] ["python3" "-c" (:text blk)])
+(defmethod command-for "python3" [_ _ blk] ["python3" "-c" (:text blk)])
+;; (defmethod command-for "node"  [_ _ blk] ["node"  "-e" (:text blk)])
+;; (defmethod command-for "ruby"  [_ _ blk] ["ruby"  "-e" (:text blk)])
+
+(defn- execute-command! [cmd cfg]
+  (println (yellow "  ⏳ running…"))
+  (let [{:keys [exit out err]} (run-command cmd (->long 60000 (:exec-timeout-ms cfg)))]
+    (case exit
+      :timeout (println (red "  ⏱ timed out — process killed"))
+      :error   (println (red "  ✗ could not start " (first cmd) ":") (str err))
+      (do
+        (println (if (zero? exit)
+                   (green (str "  ✓ exit " exit))
+                   (red   (str "  ✗ exit " exit))))
+        (print-out "stdout:" out)
+        (print-out "stderr:" err)))))
+
+(defn- maybe-execute
+  "Standard approval flow for an executable code segment. Returns policy."
+  [seg policy cfg]
+  (let [choice (cond
+                 (= policy :all)      :all
+                 (= policy :skip-all) :skip-all
+                 :else                (ask!))]
+    (when (#{:yes :all} choice)
+      (execute-command! (command-for (:lang seg) seg) cfg))
+    (cond (= choice :all)      :all
+          (= choice :skip-all) :skip-all
+          :else                policy)))
+
+;; ──────────────────────────────────────────────────────────────────────
+;; EXTENSION POINT #2 — process-segment
+;;
+;; Dispatched once per segment of an active-mode message:
+;;   :text             -> prose (rendered as markdown)
+;;   [:code "bash"]    -> exact-language override (wins over :default)
+;;   [:code :default]  -> any other code block: rendered, and if
+;;                        command-for knows the language, run through the
+;;                        standard approval flow
+;; Every method must RETURN the new policy (:ask | :all | :skip-all).
+;; The whole message is just:  (reduce process-segment :ask segments)
+;; ──────────────────────────────────────────────────────────────────────
+
+(defmulti process-segment
+  "Process one active-mode segment; returns the updated policy."
+  (fn [seg _policy _cfg]
+    (if (= :code (:kind seg))
+      [:code (or (:lang seg) "")]
+      (:kind seg))))
+
+(defmethod process-segment :text [seg policy _cfg]
+  (println (fmt-text (:text seg)))
+  (println)
+  policy)
+
+(defmethod process-segment [:code :default] [seg policy cfg]
+  (println (render-code seg))
+  (println)
+  (if (command-for (:lang seg) seg)
+    (maybe-execute seg policy cfg)
+    policy))
+
+;; Example of an exact-language override (takes precedence over :default):
+;;   (defmethod process-segment [:code "python"] [seg policy cfg]
+;;     (println (render-code seg)) (println)
+;;     ...custom behavior, return policy...)
+
+;; ── the two modes ─────────────────────────────────────────────────────
+
+(defn- process-default [text source]
+  (let [bar (apply str (repeat 66 "="))]
+    (println)
+    (println bar)
+    (println "📩 from" source "·" (count text) "chars")
+    (println bar)
+    (println text)
+    (println bar)))
+
+(defn- process-active [text cfg]
+  (println)
+  (println (dim (str "╭── markdown · " (count text) " chars " (apply str (repeat 30 "─")))))
+  (reduce (fn [policy seg] (process-segment seg policy cfg))
+          :ask
+          (split-segments text))
+  (println (dim (str "╰" (apply str (repeat 60 "─"))))))
+
+;; ── http ──────────────────────────────────────────────────────────────
+
+(defn- json-resp [status m]
+  {:status  status
+   :headers {"Content-Type" "application/json"
+             "Access-Control-Allow-Origin"  "*"
+             "Access-Control-Allow-Methods" "GET, POST, OPTIONS"
+             "Access-Control-Allow-Headers" "Content-Type, X-Relay-Token"}
+   :body    (json/write-str m)})
+
+(defn- no-content []
+  {:status 204
+   :headers {"Access-Control-Allow-Origin"  "*"
+             "Access-Control-Allow-Methods" "GET, POST, OPTIONS"
+             "Access-Control-Allow-Headers" "Content-Type, X-Relay-Token"}
+   :body nil})
+
+(defn- authorized? [req]
+  (let [{:keys [token]} @config]
+    (or (str/blank? token)
+        (= token (get-in req [:headers "x-relay-token"])))))
+
+(defn- read-body [req]
+  (if-let [b (:body req)]
+    (slurp b :encoding "UTF-8")
+    ""))
+
+(defn- parse-payload [raw]
+  (try
+    (let [d (json/read-str raw)]
+      (if (map? d)
+        {:text (str (get d "text")) :source (str (get d "source" "unknown"))}
+        {:text raw :source "unknown"}))
+    (catch Exception _ {:text raw :source "unknown"})))
+
+(defn- handle-send [req]
+  (let [cfg @config
+        {:keys [text source]} (parse-payload (read-body req))
+        text  (str/trim text)
+        limit (:max-length cfg)
+        text  (if (and limit (> (count text) (int limit))) (subs text 0 limit) text)]
+    (cond
+      (str/blank? text)
+      (json-resp 400 {:ok false :error "empty text"})
+
+      :else
+      (do (if (= "active" (:mode cfg))
+            (locking prompt-lock (process-active text cfg))
+            (process-default text source))
+          (flush)
+          (json-resp 200 {:ok true})))))
+
+(defn- handle-mode [req]
+  (case (:request-method req)
+    :get (json-resp 200 {:mode (:mode @config)})
+    :post (let [mode (try (json/read-str (read-body req)) (catch Exception _ nil))]
+            (if (contains? #{"active" "default"} (str mode))
+              (do (swap! config assoc :mode mode)
+                  (save-config!)
+                  (println (str "\n[mode] → " mode))
+                  (flush)
+                  (json-resp 200 {:ok true :mode mode}))
+              (json-resp 400 {:ok false :error "mode must be \"active\" or \"default\""})))
+    :options (no-content)
+    (json-resp 405 {:ok false :error "method not allowed"})))
+
+(defn- clean-path [uri]
+  (let [p (str/replace (first (str/split (or uri "/") #"\?")) #"/+$" "")]
+    (if (str/blank? p) "/" p)))
+
+(defn handler [req]
+  (try
+    (if-not (authorized? req)
+      (json-resp 401 {:ok false :error "missing or bad X-Relay-Token"})
+      (case (clean-path (:uri req))
+        "/send" (case (:request-method req)
+                  :post    (handle-send req)
+                  :options (no-content)
+                  (json-resp 405 {:ok false :error "POST required"}))
+        "/mode" (handle-mode req)
+        (json-resp 404 {:ok false :error (str "unknown path " (:uri req))})))
+    (catch Exception e
+      (json-resp 500 {:ok false :error (str (ex-message e))}))))
+
+;; ── main ──────────────────────────────────────────────────────────────
+
+(defn -main [& _]
+  (load-config!)
+  (let [{:keys [host port mode token exec-timeout-ms]} @config]
+    (println "──────────────────────────────────────────────────────")
+    (println " LLM Relay Server (Clojure)")
+    (println (str "  ->  http://" host ":" port "/send"))
+    (println (str "  mode    : " (if (= "active" mode)
+                                   "ACTIVE — markdown + executable code (asks first)"
+                                   "default — plain echo")))
+    (println (str "  config  : " (.getAbsolutePath config-file) "  (mode persisted here)"))
+    (println (str "  token   : " (if (str/blank? token) "disabled" "enabled")))
+    (println (str "  timeout : " exec-timeout-ms " ms per code block"))
+    (println "  switch  : curl -X POST :8765/mode -d '{\"mode\":\"active\"}'")
+    (println "──────────────────────────────────────────────────────")
+    (flush)
+    (jetty/run-jetty #'handler {:host host :port (->long 8765 port)})))
+CLOJEOF
+
+wc -l server-clj/src/llm_relay/server.clj
+```
+
+## 2 · Syntax-check, restart, test
+
+```bash
+cd server-clj && clojure -M -e "(require 'llm-relay.server) (println :syntax-ok)"; cd ..
+
+make run-clj        # restart it (config is read at startup)
+```
+
+In a second terminal — activate mode and send a message with **two** different executable languages:
+
+```bash
+curl -s -X POST http://127.0.0.1:8765/mode -d '{"mode":"active"}'
+
+python3 - << 'EOF'
+import json, urllib.request
+fence = "`" * 3
+text = ("## Demo\n\nProse renders as markdown.\n\n"
+        + fence + "bash\necho from bash\n" + fence + "\n\n"
+        + fence + "python\nprint('from python')\n" + fence + "\n\nDone.")
+req = urllib.request.Request("http://127.0.0.1:8765/send",
+      data=json.dumps({"text": text, "source": "curl"}).encode(),
+      headers={"Content-Type": "application/json"})
+print(urllib.request.urlopen(req).read().decode())
+EOF
+```
+
+You'll be prompted twice — once for the bash block, once for the python block. Answer `a` on the first to auto-run the rest, or `q` to skip everything after. A `sql` or unknown-language fence in the same message just displays.
+
+## 3 · Keep DESIGN.md accurate
+
+```bash
+python3 - << 'EOF'
+import re, pathlib
+f = pathlib.Path("DESIGN.md")
+t = f.read_text()
+
+new_73 = """### 7.3 Execution gate (multimethod architecture)
+
+Active mode is built on two open multimethods - extending it means adding
+defmethods, never editing the core loop:
+
+-   process-segment - dispatched once per segment. Dispatch value: :text
+    for prose, [:code "lang"] for an exact-language override, [:code
+    :default] for any other code block. Each method renders/prints as
+    needed and RETURNS the possibly-updated policy (:ask | :all |
+    :skip-all); the message loop is just (reduce ... :ask segments).
+-   command-for - the main extension point. Dispatches on the fence
+    language and returns the command VECTOR that runs a block, or nil
+    (the :default) meaning display-only. Because [:code :default]
+    consults command-for, ONE defmethod makes a language executable:
+
+        (defmethod command-for "node" [_ _ b] ["node" "-e" (:text b)])
+
+    Shipped: bash, sh, shell, zsh (via bash), python, python3.
+-   For each executable block the server prints:
+        ▶ Execute this block?  [y]es  [n]o (display only)  [a]ll remaining  [q]uit
+    read from the server terminal's stdin.
+-   Policy state machine: y/n apply to one block; a = :all (execute the
+    remaining blocks without asking); q = :skip-all (display only from
+    here on). EOF on stdin or unrecognized input = :no (fail safe).
+-   An exact [:code "lang"] process-segment method overrides the standard
+    prompt/run flow for that language (rare - e.g. auto-run trusted
+    languages without asking).
+-   run-command: ProcessBuilder with the command vector (no shell); child
+    stdin closed immediately; stdout/stderr drained on futures; killed
+    after exec-timeout-ms (default 60000); exit code, stdout, stderr are
+    printed.
+-   prompt-lock serializes concurrent /send requests around the
+    interactive prompt; ANSI colors only on a real console with NO_COLOR
+    unset.
+
+"""
+t, n1 = re.subn(r"### 7\.3 .*?(?=### 7\.4)", new_73, t, flags=re.S)
+assert n1 == 1, "section 7.3 not found"
+
+addition = """Add an executable code language (Clojure active mode): one defmethod in
+server-clj/src/llm_relay/server.clj, then restart - e.g.
+
+    (defmethod command-for "node" [_ _ b] ["node" "-e" (:text b)])
+
+To customize a language beyond the standard prompt/run flow, add an exact
+[:code "lang"] process-segment method (see section 7.3).
+
+"""
+t, n2 = re.subn(r"(?=## 11\. Development)", addition, t)
+assert n2 == 1, "section 10 insertion point not found"
+
+f.write_text(t)
+print("✓ DESIGN.md updated (7.3 rewritten, extension recipe added)")
+EOF
+```
+
+## 4 · Commit
+
+```bash
+git add server-clj/src/llm_relay/server.clj DESIGN.md
+git commit -m "Clojure active mode: defmulti/defmethod processing (command-for + process-segment), extensible languages"
 git push
 ```
 
-What the document covers, in brief:
+Design notes on the shape:
 
-- **§1–3** — purpose, architecture diagram, repo layout
-- **§4** — the wire protocol (endpoints, payload, errors, auth) — the contract both servers share
-- **§5** — extension internals: manifest/permissions, the internal message-type table, the extraction pipeline, per-message button placement strategy, all six trigger paths, and the on-demand injection mechanism
-- **§6–7** — Python server (live config reload, command dispatch, `{content}`/stdin model) and Clojure server (default/active modes, markdown pipeline, the y/n/a/q approval gate and policy state machine, timeouts)
-- **§8–9** — full configuration reference tables and the security model (loopback, token, why CORS is open, fail-closed execution)
-- **§10–12** — extension recipes (add a site, add a message type), dev workflow, and ten numbered design decisions/limitations — including the rendered-text-vs-markdown caveat and the two servers' intentional config-reload difference
-
-A useful side effect: because it's written to stand alone, you can also drop `DESIGN.md` into any future LLM conversation as context and it will have everything needed to modify this project correctly.
+- **`command-for` returns a vector, not a string** — `ProcessBuilder` runs it directly with no shell, so no quoting/injection concerns per new language; the block text travels as a single argv element.
+- **Policy lives in the method return values**, so a custom `[:code "lang"]` method participates in the same `a`/`q` state machine by returning `:all` / `:skip-all` when it wants to.
+- **Dispatch is open in both dimensions**: a brand-new *content kind* (say `:image`, `:table`) is just another `defmethod process-segment` — `split-segments` is the only place that would need to learn to emit it.
+- Per-language timeouts were deliberately left uniform (`exec-timeout-ms`); if you later want `"python"` to get 15s but `"bash"` 60s, the natural evolution is a third small multimethod `timeout-for` — same pattern, drop-in.

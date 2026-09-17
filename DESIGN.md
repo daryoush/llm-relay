@@ -258,26 +258,40 @@ server-clj/config.json. Default mode on first run.
 3.  :code segments → render-code: lang label + vertical-bar prefix, cyan
     body. All code is DISPLAYED first; nothing runs yet.
 
-### 7.3 Bash execution gate
+### 7.3 Execution gate (multimethod architecture)
 
--   A code block qualifies as executable only if its fence language is one
-    of: bash, sh, shell, zsh.
--   For each qualifying block the server prints:
+Active mode is built on two open multimethods - extending it means adding
+defmethods, never editing the core loop:
+
+-   process-segment - dispatched once per segment. Dispatch value: :text
+    for prose, [:code "lang"] for an exact-language override, [:code
+    :default] for any other code block. Each method renders/prints as
+    needed and RETURNS the possibly-updated policy (:ask | :all |
+    :skip-all); the message loop is just (reduce ... :ask segments).
+-   command-for - the main extension point. Dispatches on the fence
+    language and returns the command VECTOR that runs a block, or nil
+    (the :default) meaning display-only. Because [:code :default]
+    consults command-for, ONE defmethod makes a language executable:
+
+        (defmethod command-for "node" [_ _ b] ["node" "-e" (:text b)])
+
+    Shipped: bash, sh, shell, zsh (via bash), python, python3.
+-   For each executable block the server prints:
         ▶ Execute this block?  [y]es  [n]o (display only)  [a]ll remaining  [q]uit
-    The prompt is read from the server terminal's stdin.
--   Policy state machine across the message: answers y/n apply to one block;
-    a sets policy :all (execute every remaining bash block without asking);
-    q sets policy :skip-all (display only from here on).
--   Fail-safe: EOF on stdin (e.g. server run under nohup) or any
-    unrecognized answer = :no (display only).
--   run-bash: ProcessBuilder ["bash" "-c" script]; child stdin closed
-    immediately; stdout/stderr drained on futures; waitFor with
-    exec-timeout-ms (default 60000) then destroyForcibly. Result printed
-    with exit code, stdout, stderr.
--   prompt-lock: concurrent /send requests serialize around the interactive
-    prompt so two conversations cannot interleave questions.
--   ANSI colors are emitted only when stdout is a real console and NO_COLOR
-    is unset.
+    read from the server terminal's stdin.
+-   Policy state machine: y/n apply to one block; a = :all (execute the
+    remaining blocks without asking); q = :skip-all (display only from
+    here on). EOF on stdin or unrecognized input = :no (fail safe).
+-   An exact [:code "lang"] process-segment method overrides the standard
+    prompt/run flow for that language (rare - e.g. auto-run trusted
+    languages without asking).
+-   run-command: ProcessBuilder with the command vector (no shell); child
+    stdin closed immediately; stdout/stderr drained on futures; killed
+    after exec-timeout-ms (default 60000); exit code, stdout, stderr are
+    printed.
+-   prompt-lock serializes concurrent /send requests around the
+    interactive prompt; ANSI colors only on a real console with NO_COLOR
+    unset.
 
 ### 7.4 State & persistence
 
@@ -348,6 +362,14 @@ Clojure: restart, except mode via /mode).
 
 Add an internal message type: follow the table in §5.3; remember to return
 true from onMessage listeners that respond asynchronously.
+
+Add an executable code language (Clojure active mode): one defmethod in
+server-clj/src/llm_relay/server.clj, then restart - e.g.
+
+    (defmethod command-for "node" [_ _ b] ["node" "-e" (:text b)])
+
+To customize a language beyond the standard prompt/run flow, add an exact
+[:code "lang"] process-segment method (see section 7.3).
 
 ## 11. Development & testing workflow
 
