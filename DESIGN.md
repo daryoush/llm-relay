@@ -1,7 +1,3 @@
-Here's the design document as a single script to run from the repo root. One deliberate choice: the doc uses **indented code blocks instead of triple-backtick fences throughout**, so the file itself can never trigger the copy-truncation problem we hit earlier — and it's safe to regenerate from this chat any time.
-
-```bash
-cat > DESIGN.md << 'EOF'
 # LLM Relay — Design Document
 
 Version: 1.1 · See README.md for installation; this document explains how the
@@ -401,26 +397,3 @@ Mode control (Clojure):
 10. The two servers deliberately differ on config semantics: Python re-reads
     config per request (live editing); Clojure loads at startup (mode is
     the runtime-switchable dimension, persisted via /mode).
-EOF
-
-wc -l DESIGN.md
-```
-
-Optional commit:
-
-```bash
-git add DESIGN.md
-git commit -m "Add design document covering extension, protocol, and both server implementations"
-git push
-```
-
-What the document covers, in brief:
-
-- **§1–3** — purpose, architecture diagram, repo layout
-- **§4** — the wire protocol (endpoints, payload, errors, auth) — the contract both servers share
-- **§5** — extension internals: manifest/permissions, the internal message-type table, the extraction pipeline, per-message button placement strategy, all six trigger paths, and the on-demand injection mechanism
-- **§6–7** — Python server (live config reload, command dispatch, `{content}`/stdin model) and Clojure server (default/active modes, markdown pipeline, the y/n/a/q approval gate and policy state machine, timeouts)
-- **§8–9** — full configuration reference tables and the security model (loopback, token, why CORS is open, fail-closed execution)
-- **§10–12** — extension recipes (add a site, add a message type), dev workflow, and ten numbered design decisions/limitations — including the rendered-text-vs-markdown caveat and the two servers' intentional config-reload difference
-
-A useful side effect: because it's written to stand alone, you can also drop `DESIGN.md` into any future LLM conversation as context and it will have everything needed to modify this project correctly.
