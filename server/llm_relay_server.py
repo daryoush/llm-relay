@@ -32,9 +32,11 @@ CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 DEFAULT_CONFIG = {
     "host": "127.0.0.1",
     "port": 8765,
-    "token": "",           # optional secret; requests must send X-Relay-Token
-    "command": "show",     # "show" | "popup" | any shell command
-    "max_length": 200000,  # truncate huge payloads (None to disable)
+    "token": "",            # optional secret; requests must send X-Relay-Token
+    "command": "save",      # "save" (default) | "show" | "popup" | any shell command
+    "save_path": "instructions.md",  # relative paths resolve against the project root
+    "save_append": False,   # true -> append with a "---" separator instead of overwriting
+    "max_length": 200000,   # truncate huge payloads (None to disable)
 }
 
 
@@ -81,6 +83,29 @@ def cmd_popup(text, meta):
     spawn([sys.executable, "-c", code], text)
 
 
+def instructions_path(cfg):
+    """Resolve save_path: absolute paths as-is; relative paths against the
+    project root (the parent directory of server/)."""
+    p = os.path.expanduser(str(cfg.get("save_path") or "instructions.md"))
+    if not os.path.isabs(p):
+        p = os.path.join(os.path.dirname(BASE_DIR), p)
+    return os.path.abspath(p)
+
+
+def cmd_save(text, meta, cfg):
+    path = instructions_path(cfg)
+    append = bool(cfg.get("save_append"))
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    sep = ("\n\n---\n\n"
+           if append and os.path.exists(path) and os.path.getsize(path) > 0 else "")
+    with open(path, "a" if append else "w", encoding="utf-8") as f:
+        f.write(sep + text.rstrip() + "\n")
+    print(f"💾 saved {len(text)} chars → {path}"
+          + ("  (appended)" if append else ""), flush=True)
+
+
 def cmd_shell(command, text):
     if "{content}" in command:
         spawn(command.replace("{content}", shlex.quote(text)), shell=True)
@@ -104,8 +129,10 @@ def spawn(cmd, text=None, shell=False):
 
 
 def run_command(cfg, text, meta):
-    command = cfg.get("command") or "show"
-    if command == "show":
+    command = cfg.get("command") or "save"
+    if command == "save":
+        cmd_save(text, meta, cfg)
+    elif command == "show":
         cmd_show(text, meta)
     elif command == "popup":
         cmd_popup(text, meta)
@@ -192,6 +219,9 @@ def main():
     print(f" LLM Relay Server  ->  http://{host}:{port}/send")
     print(f" config : {CONFIG_FILE}  (re-read per request)")
     print(f" command: {cfg.get('command')!r}")
+    if (cfg.get("command") or "save") == "save":
+        print(f" saves to: {instructions_path(cfg)}"
+              + ("  (appending)" if cfg.get("save_append") else ""))
     print(f" token  : {'enabled' if cfg.get('token') else 'disabled'}")
     print("─" * 50 + "\n")
     try:

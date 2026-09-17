@@ -3,14 +3,17 @@
 
    Protocol (same as the Python server):
      POST /send  {\"text\": \"...\", \"source\": \"chatgpt.com\"}
-     POST /mode  {\"mode\": \"active\" | \"default\"}   (persisted to config.json)
-     GET  /mode  -> current mode
+     POST /mode  {\"mode\": \"save\" | \"echo\" | \"active\"}  (persisted)
+     GET  /mode  -> current mode        (\"default\" accepted as alias of \"save\")
 
-   Modes:
-     default  print the raw text (plain echo)
-     active   render the text as markdown (ANSI) in the terminal; fenced
-              code blocks in EXECUTABLE languages are displayed, then you
-              are asked whether to run each one.
+   Modes (console behavior — in ALL modes the text is saved to
+   instructions.md unless :save-on-receive is false):
+     save (default)  persist + one-line console confirmation
+     echo            plain raw-text echo
+     active          render the text as markdown (ANSI) in the terminal;
+                     fenced code blocks in EXECUTABLE languages (see the
+                     command-for multimethod) are displayed, then you are
+                     asked whether to run each one.
 
    Active mode is built on two open multimethods:
      command-for      lang -> command vector or nil (extension point:
@@ -26,8 +29,11 @@
 (def defaults
   {:host            "127.0.0.1"
    :port            8765
-   :token           ""            ; requests must send X-Relay-Token when set
-   :mode            "default"     ; "default" | "active"
+   :token           ""               ; requests must send X-Relay-Token when set
+   :mode            "save"           ; "save" (default) | "echo" | "active"
+   :save-path       "instructions.md" ; relative -> project root (see save-path)
+   :save-append     false            ; true -> append with a --- separator
+   :save-on-receive true             ; false -> never write the file
    :exec-timeout-ms 60000
    :max-length      200000})
 
@@ -50,6 +56,9 @@
       (reset! config (merge defaults
                             (json/read-str (slurp config-file :encoding "UTF-8")
                                            :key-fn keyword)))
+      ;; migrate the legacy mode name
+      (when (= "default" (:mode @config))
+        (swap! config assoc :mode "save"))
       (catch Exception e
         (binding [*out* *err*]
           (println "[config] could not read" (str config-file) "—" (ex-message e)))))
@@ -69,6 +78,36 @@
 (def ^:private green  #(c "32" %))
 (def ^:private yellow #(c "33" %))
 (def ^:private cyan   #(c "36" %))
+
+;; ── saving (the DEFAULT action) ───────────────────────────────────────
+
+(def ^:private project-root
+  "Parent of the server's working directory — the repo root in a normal
+   clone. Relative :save-path values resolve against it."
+  (or (.getParentFile (.getAbsoluteFile (io/file ".")))
+      (io/file ".")))
+
+(defn- save-path [cfg]
+  (let [p (str (or (:save-path cfg) "instructions.md"))]
+    (if (.isAbsolute (io/file p))
+      p
+      (str (io/file project-root p)))))
+
+(defn- save-instructions!
+  "Default action for every received message: persist the text to
+   instructions.md. Overwrites by default (the file holds the latest
+   capture); with :save-append true, appends separated by a --- rule."
+  [text cfg]
+  (when-not (false? (:save-on-receive cfg))
+    (let [f       (io/file (save-path cfg))
+          append? (true? (:save-append cfg))
+          prefix  (if (and append? (.exists f) (pos? (.length f)))
+                    "\n\n---\n\n"
+                    "")]
+      (io/make-parents f)
+      (spit f (str prefix text "\n") :encoding "UTF-8" :append append?)
+      (println (green (str "💾 saved " (count text) " chars → "
+                           (.getAbsolutePath f)))))))
 
 ;; ── markdown ──────────────────────────────────────────────────────────
 
@@ -256,14 +295,9 @@
     (maybe-execute seg policy cfg)
     policy))
 
-;; Example of an exact-language override (takes precedence over :default):
-;;   (defmethod process-segment [:code "python"] [seg policy cfg]
-;;     (println (render-code seg)) (println)
-;;     ...custom behavior, return policy...)
+;; ── the modes ─────────────────────────────────────────────────────────
 
-;; ── the two modes ─────────────────────────────────────────────────────
-
-(defn- process-default [text source]
+(defn- process-echo [text source]
   (let [bar (apply str (repeat 66 "="))]
     (println)
     (println bar)
@@ -326,23 +360,30 @@
       (json-resp 400 {:ok false :error "empty text"})
 
       :else
-      (do (if (= "active" (:mode cfg))
-            (locking prompt-lock (process-active text cfg))
-            (process-default text source))
+      (do (save-instructions! text cfg)          ; the default action, in ALL modes
+          (case (:mode cfg)
+            "active" (locking prompt-lock (process-active text cfg))
+            "echo"   (process-echo text source)
+            nil)                                 ; "save": the save line above is all
           (flush)
           (json-resp 200 {:ok true})))))
 
 (defn- handle-mode [req]
   (case (:request-method req)
     :get (json-resp 200 {:mode (:mode @config)})
-    :post (let [mode (try (json/read-str (read-body req)) (catch Exception _ nil))]
-            (if (contains? #{"active" "default"} (str mode))
+    :post (let [body (try (json/read-str (read-body req)) (catch Exception _ nil))
+                mode (cond
+                       (map? body)    (str (get body "mode"))
+                       (string? body) body
+                       :else nil)
+                mode (if (= "default" mode) "save" mode)]   ; legacy alias
+            (if (contains? #{"save" "echo" "active"} mode)
               (do (swap! config assoc :mode mode)
                   (save-config!)
                   (println (str "\n[mode] → " mode))
                   (flush)
                   (json-resp 200 {:ok true :mode mode}))
-              (json-resp 400 {:ok false :error "mode must be \"active\" or \"default\""})))
+              (json-resp 400 {:ok false :error "mode must be \"save\", \"echo\" or \"active\""})))
     :options (no-content)
     (json-resp 405 {:ok false :error "method not allowed"})))
 
@@ -368,17 +409,22 @@
 
 (defn -main [& _]
   (load-config!)
-  (let [{:keys [host port mode token exec-timeout-ms]} @config]
+  (let [{:keys [mode]} @config]
     (println "──────────────────────────────────────────────────────")
     (println " LLM Relay Server (Clojure)")
-    (println (str "  ->  http://" host ":" port "/send"))
-    (println (str "  mode    : " (if (= "active" mode)
-                                   "ACTIVE — markdown + executable code (asks first)"
-                                   "default — plain echo")))
-    (println (str "  config  : " (.getAbsolutePath config-file) "  (mode persisted here)"))
-    (println (str "  token   : " (if (str/blank? token) "disabled" "enabled")))
-    (println (str "  timeout : " exec-timeout-ms " ms per code block"))
-    (println "  switch  : curl -X POST :8765/mode -d '{\"mode\":\"active\"}'")
+    (println (str "  ->  http://" (:host @config) ":" (:port @config) "/send"))
+    (println (str "  mode    : " (case mode
+                                   "active" "ACTIVE — markdown + executable code (asks first)"
+                                   "echo"   "echo — plain console output"
+                                   "save — write instructions.md (one-line note)")))
+    (println (str "  saves to: " (save-path @config)
+                  (when (true? (:save-append @config)) "  (appending)")
+                  (when (false? (:save-on-receive @config)) "  (saving DISABLED)")))
+    (println (str "  config  : " (.getAbsolutePath config-file)))
+    (println (str "  token   : " (if (str/blank? (:token @config)) "disabled" "enabled")))
+    (println (str "  timeout : " (:exec-timeout-ms @config) " ms per code block"))
+    (println "  switch  : curl -X POST :8765/mode -d '{\"mode\":\"active\"}'   ; save | echo | active")
     (println "──────────────────────────────────────────────────────")
     (flush)
-    (jetty/run-jetty #'handler {:host host :port (->long 8765 port)})))
+    (jetty/run-jetty #'handler {:host (:host @config)
+                                :port (->long 8765 (:port @config))})))

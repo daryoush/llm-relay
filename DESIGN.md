@@ -11,6 +11,8 @@ local server that runs a configurable action on the text.
 
 Typical uses:
 
+-   Persist the latest reply as instructions.md (the default action on
+    both servers).
 -   Display the reply outside the browser (console, desktop window).
 -   Pipe LLM output into local scripts, a log file, or the clipboard.
 -   (Clojure server, active mode) review and selectively execute bash code
@@ -76,7 +78,7 @@ CORS headers allowing browser origins.
 | Method | Path  | Body                          | Success response       | Python | Clojure |
 |--------|-------|-------------------------------|------------------------|--------|---------|
 | POST   | /send | JSON {"text": "...", "source": "host"} or raw text body | 200 {"ok": true} | yes | yes |
-| POST   | /mode | {"mode": "active"} or {"mode": "default"} | 200 {"ok": true, "mode": "..."} | no | yes |
+| POST   | /mode | {"mode": "save"/"echo"/"active"} (legacy "default" = alias of "save") | 200 {"ok": true, "mode": "..."} | no | yes |
 | GET    | /mode | —                             | 200 {"mode": "..."}    | no     | yes     |
 | OPTIONS| any   | —                             | 204 + CORS headers     | yes    | yes     |
 
@@ -210,7 +212,12 @@ Request handling (POST /send):
 2.  Body: JSON {"text","source"} preferred; a raw text body is accepted.
 3.  Trim; empty → 400. Truncate to max_length.
 4.  Dispatch on config command:
-    -   "show" (default): print a banner + the text to the server console.
+    -   "save" (default): write the text to instructions.md and print a
+        one-line confirmation. Target path: save_path (default
+        "instructions.md"); relative paths resolve against the PROJECT
+        ROOT (parent of server/), absolute as-is. Overwrites by default;
+        save_append true appends, separated by a "---" rule.
+    -   "show": print a banner + the text to the server console.
     -   "popup": run a small tkinter window (via python -c) that displays
         the text received on stdin.
     -   anything else: a shell command. If it contains the marker {content},
@@ -237,13 +244,17 @@ Same /send protocol; additionally /mode.
 
 ### 7.1 Modes
 
--   default: plain echo — banner, source, char count, raw text. Functionally
-    equivalent to the Python "show" command.
--   active: treats the text as markdown, renders it with ANSI styling in the
-    terminal, and gates bash execution behind an approval prompt.
+-   save (default): the received text is written to instructions.md (§7.5)
+    and the console shows a one-line confirmation.
+-   echo: plain echo — banner, source, char count, raw text (the file is
+    still saved).
+-   active: renders the text as markdown with ANSI styling and runs
+    command-for languages through the approval gate (§7.3). The file is
+    still saved.
 
-Mode is switched at runtime via POST /mode and persisted to
-server-clj/config.json. Default mode on first run.
+Mode is switched at runtime via POST /mode (save | echo | active; the
+legacy value "default" is accepted as an alias of save) and persisted to
+server-clj/config.json. Default mode on first run: save.
 
 ### 7.2 Markdown pipeline (active mode)
 
@@ -298,7 +309,21 @@ defmethods, never editing the core loop:
 -   Config is an atom loaded from config.json at STARTUP (differs from the
     Python server's per-request reload). Hand-editing the file requires a
     restart; changing mode via POST /mode persists immediately.
--   Keys: host, port, token, mode, exec-timeout-ms, max-length.
+-   Keys: host, port, token, mode, save-path, save-append,
+    save-on-receive, exec-timeout-ms, max-length.
+
+### 7.5 Saving to instructions.md
+
+The DEFAULT action on every received message is to persist the text:
+
+-   save-path (default "instructions.md"): relative paths resolve against
+    the project root (the parent directory of server-clj/); absolute
+    paths are used as-is. The resolved path is printed at startup and on
+    every save.
+-   Overwrite semantics by default — the file holds the latest capture.
+    save-append true appends instead, separating captures with a "---"
+    rule.
+-   save-on-receive false disables saving entirely (console-only modes).
 
 ## 8. Configuration reference
 
@@ -309,7 +334,9 @@ server/config.json (Python):
 | host       | 127.0.0.1 | bind address                                  |
 | port       | 8765    | listen port                                     |
 | token      | ""      | require X-Relay-Token when non-empty            |
-| command    | "show"  | show / popup / any shell command                |
+| command    | "save"  | save / show / popup / any shell command         |
+| save_path  | "instructions.md" | save target; relative → project root  |
+| save_append| false   | append with a "---" separator instead           |
 | max_length | 200000  | truncate longer payloads (null/None to disable) |
 
 server-clj/config.json (Clojure):
@@ -318,7 +345,10 @@ server-clj/config.json (Clojure):
 |-----------------|-----------|------------------------------------------|
 | host / port     | 127.0.0.1 / 8765 | bind address / port                |
 | token           | ""        | shared secret                            |
-| mode            | "default" | "default" or "active"                    |
+| mode            | "save"    | "save" (default) / "echo" / "active"; legacy "default" aliased to "save" |
+| save-path       | "instructions.md" | relative → project root          |
+| save-append     | false     | append with a "---" separator instead    |
+| save-on-receive | true      | set false to disable file writing        |
 | exec-timeout-ms | 60000     | kill bash blocks after this long          |
 | max-length      | 200000    | payload truncation                        |
 

@@ -1,17 +1,126 @@
-Good refactor target — the current `bash-langs` set + hardcoded `["bash" "-c" …]` don't scale. I've split active-mode processing into **two open multimethods**:
+Both servers now treat **"save the latest received text to `instructions.md`"** as the default action, with sensible knobs around it:
 
-- **`command-for`** — dispatched on the fence language; returns the command *vector* that runs a block, or `nil` = display-only. **This is the extension point: one `defmethod` makes a language executable.** `bash`, `sh`, `shell`, `zsh`, `python`, `python3` ship as examples.
-- **`process-segment`** — dispatched per segment on `:text` / `[:code "lang"]`; each method returns the updated policy, and the message loop is now just a `reduce`. The `[:code :default]` method consults `command-for`, so new languages automatically get the standard y/n/a/q approval flow — unless you add an exact `[:code "lang"]` method to override it.
+- **Default target:** `<project root>/instructions.md` (relative `save_path`s resolve against the repo root; absolute paths as-is). The resolved path is printed at startup and on every save.
+- **Overwrite semantics** by default — the file holds the latest capture. Set `save_append: true` to accumulate, separated by `---` rules.
+- **Python:** new built-in command `"save"` is the default; `"show"`, `"popup"`, shell commands still selectable.
+- **Clojure:** modes are now `"save"` (default — one-line console note), `"echo"` (the old plain echo), `"active"` (markdown + gated execution; **also saves the file** so you keep the reviewed content). The legacy value `"default"` is accepted as an alias for `"save"` and auto-migrated on load.
 
-Adding Node support is literally:
+⚠️ **While rewiring the Clojure `/mode` endpoint I found a real bug in the previously shipped code:** it checked `(str mode)` against the *parsed JSON object* instead of extracting the `"mode"` field, so `POST /mode` always answered 400. Fixed below — mode switching actually works now.
 
-```clojure
-(defmethod command-for "node" [_ _ b] ["node" "-e" (:text b)])
+Run everything from the repo root.
+
+## 1 · Python server patches + example config + gitignore
+
+```bash
+python3 - << 'EOF'
+import pathlib
+
+# ── server/llm_relay_server.py
+f = pathlib.Path("server/llm_relay_server.py")
+t = f.read_text()
+
+old = '''DEFAULT_CONFIG = {
+    "host": "127.0.0.1",
+    "port": 8765,
+    "token": "",           # optional secret; requests must send X-Relay-Token
+    "command": "show",     # "show" | "popup" | any shell command
+    "max_length": 200000,  # truncate huge payloads (None to disable)
+}'''
+new = '''DEFAULT_CONFIG = {
+    "host": "127.0.0.1",
+    "port": 8765,
+    "token": "",            # optional secret; requests must send X-Relay-Token
+    "command": "save",      # "save" (default) | "show" | "popup" | any shell command
+    "save_path": "instructions.md",  # relative paths resolve against the project root
+    "save_append": False,   # true -> append with a "---" separator instead of overwriting
+    "max_length": 200000,   # truncate huge payloads (None to disable)
+}'''
+assert old in t, "DEFAULT_CONFIG not found"
+t = t.replace(old, new)
+
+old = "def cmd_shell(command, text):"
+new = '''def instructions_path(cfg):
+    """Resolve save_path: absolute paths as-is; relative paths against the
+    project root (the parent directory of server/)."""
+    p = os.path.expanduser(str(cfg.get("save_path") or "instructions.md"))
+    if not os.path.isabs(p):
+        p = os.path.join(os.path.dirname(BASE_DIR), p)
+    return os.path.abspath(p)
+
+
+def cmd_save(text, meta, cfg):
+    path = instructions_path(cfg)
+    append = bool(cfg.get("save_append"))
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    sep = ("\\n\\n---\\n\\n"
+           if append and os.path.exists(path) and os.path.getsize(path) > 0 else "")
+    with open(path, "a" if append else "w", encoding="utf-8") as f:
+        f.write(sep + text.rstrip() + "\\n")
+    print(f"💾 saved {len(text)} chars → {path}"
+          + ("  (appended)" if append else ""), flush=True)
+
+
+def cmd_shell(command, text):'''
+assert old in t
+t = t.replace(old, new, 1)
+
+old = '''def run_command(cfg, text, meta):
+    command = cfg.get("command") or "show"
+    if command == "show":
+        cmd_show(text, meta)
+    elif command == "popup":
+        cmd_popup(text, meta)
+    else:
+        cmd_shell(command, text)'''
+new = '''def run_command(cfg, text, meta):
+    command = cfg.get("command") or "save"
+    if command == "save":
+        cmd_save(text, meta, cfg)
+    elif command == "show":
+        cmd_show(text, meta)
+    elif command == "popup":
+        cmd_popup(text, meta)
+    else:
+        cmd_shell(command, text)'''
+assert old in t
+t = t.replace(old, new)
+
+old = '''    print(f" command: {cfg.get('command')!r}")'''
+new = '''    print(f" command: {cfg.get('command')!r}")
+    if (cfg.get("command") or "save") == "save":
+        print(f" saves to: {instructions_path(cfg)}"
+              + ("  (appending)" if cfg.get("save_append") else ""))'''
+assert old in t
+t = t.replace(old, new)
+
+f.write_text(t)
+print("✓ llm_relay_server.py patched")
+EOF
+
+cat > server/config.example.json << 'EOF'
+{
+  "host": "127.0.0.1",
+  "port": 8765,
+  "token": "",
+  "command": "save",
+  "save_path": "instructions.md",
+  "save_append": false,
+  "max_length": 200000
+}
+EOF
+
+cat >> .gitignore << 'EOF'
+
+# default save target for received messages (remove this line to track it in git)
+instructions.md
+EOF
 ```
 
-## 1 · Rewrite `server.clj`
+**Note:** your existing `server/config.json` (gitignored, created earlier) still says `"command": "show"` — the Python server re-reads it per request, so it keeps echoing until you either edit that file to `"save"` or delete it and let `make run` regenerate it.
 
-From the repo root (fence regex still built at runtime — no literal backtick sequences):
+## 2 · Clojure server — full rewrite (includes the `/mode` bug fix)
 
 ```bash
 cat > server-clj/src/llm_relay/server.clj << 'CLOJEOF'
@@ -20,14 +129,17 @@ cat > server-clj/src/llm_relay/server.clj << 'CLOJEOF'
 
    Protocol (same as the Python server):
      POST /send  {\"text\": \"...\", \"source\": \"chatgpt.com\"}
-     POST /mode  {\"mode\": \"active\" | \"default\"}   (persisted to config.json)
-     GET  /mode  -> current mode
+     POST /mode  {\"mode\": \"save\" | \"echo\" | \"active\"}  (persisted)
+     GET  /mode  -> current mode        (\"default\" accepted as alias of \"save\")
 
-   Modes:
-     default  print the raw text (plain echo)
-     active   render the text as markdown (ANSI) in the terminal; fenced
-              code blocks in EXECUTABLE languages are displayed, then you
-              are asked whether to run each one.
+   Modes (console behavior — in ALL modes the text is saved to
+   instructions.md unless :save-on-receive is false):
+     save (default)  persist + one-line console confirmation
+     echo            plain raw-text echo
+     active          render the text as markdown (ANSI) in the terminal;
+                     fenced code blocks in EXECUTABLE languages (see the
+                     command-for multimethod) are displayed, then you are
+                     asked whether to run each one.
 
    Active mode is built on two open multimethods:
      command-for      lang -> command vector or nil (extension point:
@@ -43,8 +155,11 @@ cat > server-clj/src/llm_relay/server.clj << 'CLOJEOF'
 (def defaults
   {:host            "127.0.0.1"
    :port            8765
-   :token           ""            ; requests must send X-Relay-Token when set
-   :mode            "default"     ; "default" | "active"
+   :token           ""               ; requests must send X-Relay-Token when set
+   :mode            "save"           ; "save" (default) | "echo" | "active"
+   :save-path       "instructions.md" ; relative -> project root (see save-path)
+   :save-append     false            ; true -> append with a --- separator
+   :save-on-receive true             ; false -> never write the file
    :exec-timeout-ms 60000
    :max-length      200000})
 
@@ -67,6 +182,9 @@ cat > server-clj/src/llm_relay/server.clj << 'CLOJEOF'
       (reset! config (merge defaults
                             (json/read-str (slurp config-file :encoding "UTF-8")
                                            :key-fn keyword)))
+      ;; migrate the legacy mode name
+      (when (= "default" (:mode @config))
+        (swap! config assoc :mode "save"))
       (catch Exception e
         (binding [*out* *err*]
           (println "[config] could not read" (str config-file) "—" (ex-message e)))))
@@ -86,6 +204,36 @@ cat > server-clj/src/llm_relay/server.clj << 'CLOJEOF'
 (def ^:private green  #(c "32" %))
 (def ^:private yellow #(c "33" %))
 (def ^:private cyan   #(c "36" %))
+
+;; ── saving (the DEFAULT action) ───────────────────────────────────────
+
+(def ^:private project-root
+  "Parent of the server's working directory — the repo root in a normal
+   clone. Relative :save-path values resolve against it."
+  (or (.getParentFile (.getAbsoluteFile (io/file ".")))
+      (io/file ".")))
+
+(defn- save-path [cfg]
+  (let [p (str (or (:save-path cfg) "instructions.md"))]
+    (if (.isAbsolute (io/file p))
+      p
+      (str (io/file project-root p)))))
+
+(defn- save-instructions!
+  "Default action for every received message: persist the text to
+   instructions.md. Overwrites by default (the file holds the latest
+   capture); with :save-append true, appends separated by a --- rule."
+  [text cfg]
+  (when-not (false? (:save-on-receive cfg))
+    (let [f       (io/file (save-path cfg))
+          append? (true? (:save-append cfg))
+          prefix  (if (and append? (.exists f) (pos? (.length f)))
+                    "\n\n---\n\n"
+                    "")]
+      (io/make-parents f)
+      (spit f (str prefix text "\n") :encoding "UTF-8" :append append?)
+      (println (green (str "💾 saved " (count text) " chars → "
+                           (.getAbsolutePath f)))))))
 
 ;; ── markdown ──────────────────────────────────────────────────────────
 
@@ -273,14 +421,9 @@ cat > server-clj/src/llm_relay/server.clj << 'CLOJEOF'
     (maybe-execute seg policy cfg)
     policy))
 
-;; Example of an exact-language override (takes precedence over :default):
-;;   (defmethod process-segment [:code "python"] [seg policy cfg]
-;;     (println (render-code seg)) (println)
-;;     ...custom behavior, return policy...)
+;; ── the modes ─────────────────────────────────────────────────────────
 
-;; ── the two modes ─────────────────────────────────────────────────────
-
-(defn- process-default [text source]
+(defn- process-echo [text source]
   (let [bar (apply str (repeat 66 "="))]
     (println)
     (println bar)
@@ -343,23 +486,30 @@ cat > server-clj/src/llm_relay/server.clj << 'CLOJEOF'
       (json-resp 400 {:ok false :error "empty text"})
 
       :else
-      (do (if (= "active" (:mode cfg))
-            (locking prompt-lock (process-active text cfg))
-            (process-default text source))
+      (do (save-instructions! text cfg)          ; the default action, in ALL modes
+          (case (:mode cfg)
+            "active" (locking prompt-lock (process-active text cfg))
+            "echo"   (process-echo text source)
+            nil)                                 ; "save": the save line above is all
           (flush)
           (json-resp 200 {:ok true})))))
 
 (defn- handle-mode [req]
   (case (:request-method req)
     :get (json-resp 200 {:mode (:mode @config)})
-    :post (let [mode (try (json/read-str (read-body req)) (catch Exception _ nil))]
-            (if (contains? #{"active" "default"} (str mode))
+    :post (let [body (try (json/read-str (read-body req)) (catch Exception _ nil))
+                mode (cond
+                       (map? body)    (str (get body "mode"))
+                       (string? body) body
+                       :else nil)
+                mode (if (= "default" mode) "save" mode)]   ; legacy alias
+            (if (contains? #{"save" "echo" "active"} mode)
               (do (swap! config assoc :mode mode)
                   (save-config!)
                   (println (str "\n[mode] → " mode))
                   (flush)
                   (json-resp 200 {:ok true :mode mode}))
-              (json-resp 400 {:ok false :error "mode must be \"active\" or \"default\""})))
+              (json-resp 400 {:ok false :error "mode must be \"save\", \"echo\" or \"active\""})))
     :options (no-content)
     (json-resp 405 {:ok false :error "method not allowed"})))
 
@@ -385,128 +535,171 @@ cat > server-clj/src/llm_relay/server.clj << 'CLOJEOF'
 
 (defn -main [& _]
   (load-config!)
-  (let [{:keys [host port mode token exec-timeout-ms]} @config]
+  (let [{:keys [mode]} @config]
     (println "──────────────────────────────────────────────────────")
     (println " LLM Relay Server (Clojure)")
-    (println (str "  ->  http://" host ":" port "/send"))
-    (println (str "  mode    : " (if (= "active" mode)
-                                   "ACTIVE — markdown + executable code (asks first)"
-                                   "default — plain echo")))
-    (println (str "  config  : " (.getAbsolutePath config-file) "  (mode persisted here)"))
-    (println (str "  token   : " (if (str/blank? token) "disabled" "enabled")))
-    (println (str "  timeout : " exec-timeout-ms " ms per code block"))
-    (println "  switch  : curl -X POST :8765/mode -d '{\"mode\":\"active\"}'")
+    (println (str "  ->  http://" (:host @config) ":" (:port @config) "/send"))
+    (println (str "  mode    : " (case mode
+                                   "active" "ACTIVE — markdown + executable code (asks first)"
+                                   "echo"   "echo — plain console output"
+                                   "save — write instructions.md (one-line note)")))
+    (println (str "  saves to: " (save-path @config)
+                  (when (true? (:save-append @config)) "  (appending)")
+                  (when (false? (:save-on-receive @config)) "  (saving DISABLED)")))
+    (println (str "  config  : " (.getAbsolutePath config-file)))
+    (println (str "  token   : " (if (str/blank? (:token @config)) "disabled" "enabled")))
+    (println (str "  timeout : " (:exec-timeout-ms @config) " ms per code block"))
+    (println "  switch  : curl -X POST :8765/mode -d '{\"mode\":\"active\"}'   ; save | echo | active")
     (println "──────────────────────────────────────────────────────")
     (flush)
-    (jetty/run-jetty #'handler {:host host :port (->long 8765 port)})))
+    (jetty/run-jetty #'handler {:host (:host @config)
+                                :port (->long 8765 (:port @config))})))
 CLOJEOF
 
-wc -l server-clj/src/llm_relay/server.clj
-```
-
-## 2 · Syntax-check, restart, test
-
-```bash
 cd server-clj && clojure -M -e "(require 'llm-relay.server) (println :syntax-ok)"; cd ..
-
-make run-clj        # restart it (config is read at startup)
 ```
 
-In a second terminal — activate mode and send a message with **two** different executable languages:
+Your existing `server-clj/config.json` needs no edits — `"default"` is auto-migrated to `"save"` on load and the new keys fall back to defaults.
+
+## 3 · Update README, extension hint, DESIGN.md
 
 ```bash
-curl -s -X POST http://127.0.0.1:8765/mode -d '{"mode":"active"}'
+python3 - << 'EOF'
+import pathlib
 
+# README
+f = pathlib.Path("README.md"); t = f.read_text()
+old = '    "show"                            print to the server console (default)\n'
+new = ('    "save"                            write instructions.md (default)\n'
+       '    "show"                            print to the server console\n')
+assert old in t; f.write_text(t.replace(old, new)); print("✓ README.md")
+
+# extension options hint
+f = pathlib.Path("extension/options.html"); t = f.read_text()
+old = "(default command: print it)"
+new = "(default command: save it to instructions.md)"
+assert old in t; f.write_text(t.replace(old, new)); print("✓ extension/options.html")
+
+# DESIGN.md
+f = pathlib.Path("DESIGN.md"); t = f.read_text()
+
+old = "-   Display the reply outside the browser (console, desktop window)."
+new = ("-   Persist the latest reply as instructions.md (the default action on\n"
+       "    both servers).\n"
+       "-   Display the reply outside the browser (console, desktop window).")
+assert old in t; t = t.replace(old, new, 1)
+
+old = '| POST   | /mode | {"mode": "active"} or {"mode": "default"} | 200 {"ok": true, "mode": "..."} | no | yes |'
+new = '| POST   | /mode | {"mode": "save"/"echo"/"active"} (legacy "default" = alias of "save") | 200 {"ok": true, "mode": "..."} | no | yes |'
+assert old in t; t = t.replace(old, new, 1)
+
+old = '''4.  Dispatch on config command:
+    -   "show" (default): print a banner + the text to the server console.'''
+new = '''4.  Dispatch on config command:
+    -   "save" (default): write the text to instructions.md and print a
+        one-line confirmation. Target path: save_path (default
+        "instructions.md"); relative paths resolve against the PROJECT
+        ROOT (parent of server/), absolute as-is. Overwrites by default;
+        save_append true appends, separated by a "---" rule.
+    -   "show": print a banner + the text to the server console.'''
+assert old in t; t = t.replace(old, new, 1)
+
+old = '''-   default: plain echo — banner, source, char count, raw text. Functionally
+    equivalent to the Python "show" command.
+-   active: treats the text as markdown, renders it with ANSI styling in the
+    terminal, and gates bash execution behind an approval prompt.
+
+Mode is switched at runtime via POST /mode and persisted to
+server-clj/config.json. Default mode on first run.'''
+new = '''-   save (default): the received text is written to instructions.md (§7.5)
+    and the console shows a one-line confirmation.
+-   echo: plain echo — banner, source, char count, raw text (the file is
+    still saved).
+-   active: renders the text as markdown with ANSI styling and runs
+    command-for languages through the approval gate (§7.3). The file is
+    still saved.
+
+Mode is switched at runtime via POST /mode (save | echo | active; the
+legacy value "default" is accepted as an alias of save) and persisted to
+server-clj/config.json. Default mode on first run: save.'''
+assert old in t; t = t.replace(old, new, 1)
+
+old = "-   Keys: host, port, token, mode, exec-timeout-ms, max-length."
+new = ("-   Keys: host, port, token, mode, save-path, save-append,\n"
+       "    save-on-receive, exec-timeout-ms, max-length.")
+assert old in t; t = t.replace(old, new, 1)
+
+old = "## 8. Configuration reference"
+new = '''### 7.5 Saving to instructions.md
+
+The DEFAULT action on every received message is to persist the text:
+
+-   save-path (default "instructions.md"): relative paths resolve against
+    the project root (the parent directory of server-clj/); absolute
+    paths are used as-is. The resolved path is printed at startup and on
+    every save.
+-   Overwrite semantics by default — the file holds the latest capture.
+    save-append true appends instead, separating captures with a "---"
+    rule.
+-   save-on-receive false disables saving entirely (console-only modes).
+
+## 8. Configuration reference'''
+assert old in t; t = t.replace(old, new, 1)
+
+old = '| command    | "show"  | show / popup / any shell command                |'
+new = ('| command    | "save"  | save / show / popup / any shell command         |\n'
+       '| save_path  | "instructions.md" | save target; relative → project root  |\n'
+       '| save_append| false   | append with a "---" separator instead           |')
+assert old in t; t = t.replace(old, new, 1)
+
+old = '| mode            | "default" | "default" or "active"                    |'
+new = ('| mode            | "save"    | "save" (default) / "echo" / "active"; legacy "default" aliased to "save" |\n'
+       '| save-path       | "instructions.md" | relative → project root          |\n'
+       '| save-append     | false     | append with a "---" separator instead    |\n'
+       '| save-on-receive | true      | set false to disable file writing        |')
+assert old in t; t = t.replace(old, new, 1)
+
+f.write_text(t); print("✓ DESIGN.md")
+EOF
+```
+
+## 4 · Test
+
+```bash
+rm -f server/config.json        # regenerate with the new default
+make run &                      # terminal 1 (or run in its own terminal)
+sleep 1
+make test                       # terminal 2
+cat instructions.md             # → "hello from make test"
+
+# Clojure side — stop the Python server first (same port), then:
+make run-clj &
 python3 - << 'EOF'
 import json, urllib.request
 fence = "`" * 3
-text = ("## Demo\n\nProse renders as markdown.\n\n"
-        + fence + "bash\necho from bash\n" + fence + "\n\n"
-        + fence + "python\nprint('from python')\n" + fence + "\n\nDone.")
+text = ("## Demo\n\n" + fence + "bash\necho captured AND executed?\n" + fence)
 req = urllib.request.Request("http://127.0.0.1:8765/send",
       data=json.dumps({"text": text, "source": "curl"}).encode(),
       headers={"Content-Type": "application/json"})
 print(urllib.request.urlopen(req).read().decode())
 EOF
+# server console: 💾 saved … chars → …/instructions.md, then the markdown + prompt
+curl -s -X POST http://127.0.0.1:8765/mode -d '{"mode":"echo"}'   # works now (bug fixed)
+curl -s http://127.0.0.1:8765/mode
 ```
 
-You'll be prompted twice — once for the bash block, once for the python block. Answer `a` on the first to auto-run the rest, or `q` to skip everything after. A `sql` or unknown-language fence in the same message just displays.
-
-## 3 · Keep DESIGN.md accurate
+## 5 · Commit
 
 ```bash
-python3 - << 'EOF'
-import re, pathlib
-f = pathlib.Path("DESIGN.md")
-t = f.read_text()
-
-new_73 = """### 7.3 Execution gate (multimethod architecture)
-
-Active mode is built on two open multimethods - extending it means adding
-defmethods, never editing the core loop:
-
--   process-segment - dispatched once per segment. Dispatch value: :text
-    for prose, [:code "lang"] for an exact-language override, [:code
-    :default] for any other code block. Each method renders/prints as
-    needed and RETURNS the possibly-updated policy (:ask | :all |
-    :skip-all); the message loop is just (reduce ... :ask segments).
--   command-for - the main extension point. Dispatches on the fence
-    language and returns the command VECTOR that runs a block, or nil
-    (the :default) meaning display-only. Because [:code :default]
-    consults command-for, ONE defmethod makes a language executable:
-
-        (defmethod command-for "node" [_ _ b] ["node" "-e" (:text b)])
-
-    Shipped: bash, sh, shell, zsh (via bash), python, python3.
--   For each executable block the server prints:
-        ▶ Execute this block?  [y]es  [n]o (display only)  [a]ll remaining  [q]uit
-    read from the server terminal's stdin.
--   Policy state machine: y/n apply to one block; a = :all (execute the
-    remaining blocks without asking); q = :skip-all (display only from
-    here on). EOF on stdin or unrecognized input = :no (fail safe).
--   An exact [:code "lang"] process-segment method overrides the standard
-    prompt/run flow for that language (rare - e.g. auto-run trusted
-    languages without asking).
--   run-command: ProcessBuilder with the command vector (no shell); child
-    stdin closed immediately; stdout/stderr drained on futures; killed
-    after exec-timeout-ms (default 60000); exit code, stdout, stderr are
-    printed.
--   prompt-lock serializes concurrent /send requests around the
-    interactive prompt; ANSI colors only on a real console with NO_COLOR
-    unset.
-
-"""
-t, n1 = re.subn(r"### 7\.3 .*?(?=### 7\.4)", new_73, t, flags=re.S)
-assert n1 == 1, "section 7.3 not found"
-
-addition = """Add an executable code language (Clojure active mode): one defmethod in
-server-clj/src/llm_relay/server.clj, then restart - e.g.
-
-    (defmethod command-for "node" [_ _ b] ["node" "-e" (:text b)])
-
-To customize a language beyond the standard prompt/run flow, add an exact
-[:code "lang"] process-segment method (see section 7.3).
-
-"""
-t, n2 = re.subn(r"(?=## 11\. Development)", addition, t)
-assert n2 == 1, "section 10 insertion point not found"
-
-f.write_text(t)
-print("✓ DESIGN.md updated (7.3 rewritten, extension recipe added)")
-EOF
-```
-
-## 4 · Commit
-
-```bash
-git add server-clj/src/llm_relay/server.clj DESIGN.md
-git commit -m "Clojure active mode: defmulti/defmethod processing (command-for + process-segment), extensible languages"
+git add server/llm_relay_server.py server/config.example.json \
+        server-clj/src/llm_relay/server.clj .gitignore README.md \
+        extension/options.html DESIGN.md
+git commit -m "Default action on both servers: save received text to instructions.md; fix Clojure /mode parsing bug"
 git push
 ```
 
-Design notes on the shape:
+Notes:
 
-- **`command-for` returns a vector, not a string** — `ProcessBuilder` runs it directly with no shell, so no quoting/injection concerns per new language; the block text travels as a single argv element.
-- **Policy lives in the method return values**, so a custom `[:code "lang"]` method participates in the same `a`/`q` state machine by returning `:all` / `:skip-all` when it wants to.
-- **Dispatch is open in both dimensions**: a brand-new *content kind* (say `:image`, `:table`) is just another `defmethod process-segment` — `split-segments` is the only place that would need to learn to emit it.
-- Per-language timeouts were deliberately left uniform (`exec-timeout-ms`); if you later want `"python"` to get 15s but `"bash"` 60s, the natural evolution is a third small multimethod `timeout-for` — same pattern, drop-in.
+- **`instructions.md` is gitignored** as runtime capture output. If you actually want the file tracked (e.g., it doubles as your project's agent instructions), delete those lines from `.gitignore` and `git add -f instructions.md`.
+- Python reads config per request, so switching to `"append"` (or any other tweak) is live; Clojure needs a restart, except mode via `POST /mode`.
+- Reload the extension card if you want the options-page hint text updated (cosmetic; behavior unchanged — the extension was always mode-agnostic).

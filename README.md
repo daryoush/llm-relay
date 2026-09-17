@@ -42,7 +42,8 @@ chrome://extensions/shortcuts) · right-click menu · floating button.
 Server command is set in `server/config.json` and re-read on every request
 (no restart needed):
 
-    "show"                            print to the server console (default)
+    "save"                            write instructions.md (default)
+    "show"                            print to the server console
     "popup"                           desktop window (tkinter)
     "pbcopy" / "wl-copy" / "clip"     clipboard (macOS / Wayland / Windows)
     "cat >> llm_log.txt"              append to file
