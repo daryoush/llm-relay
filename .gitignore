@@ -15,3 +15,5 @@ server-clj/llm-relay.jar
 
 # raw request dump (diagnostics)
 server/debug_payload.jsonl
+
+*.cpcache
