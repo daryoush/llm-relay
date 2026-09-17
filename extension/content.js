@@ -3,11 +3,15 @@
 const WRAP_ID = "llr-root";
 
 // ── Per-site rules.
-//    selectors   : how to find assistant message containers (last match = newest)
-//    toolbar     : OPTIONAL exact selector for the per-message action bar.
-//                  Find it with DevTools (inspect the copy/retry icons) and add
-//                  e.g.  toolbar: 'div[class*="actions"]'  — then the heuristic
-//                  below is skipped for that site.
+//    selectors : how to find assistant message containers (last match = newest)
+//    toolbars  : OPTIONAL selectors for the per-message action bar (the row
+//                with the site's copy/retry icons). Find them with DevTools.
+//                If none matches (or the match isn't visible), a small ⇪
+//                button is placed in the message's top-right corner instead.
+//
+//    POLICY: text is captured VERBATIM (rendered innerText of a cleaned
+//    clone) and sent as-is. No filtering or transformation happens in the
+//    extension — the server owns all interpretation of the content.
 const SITE_RULES = [
   {
     match: h => /(^|\.)chatgpt\.com$/.test(h) || h === "chat.openai.com",
@@ -54,7 +58,7 @@ const GENERIC = [   // used only for "send last reply" (hotkey/popup/floating bu
 
 function siteRule() { return SITE_RULES.find(r => r.match(location.hostname)); }
 
-// ── extraction helpers ────────────────────────────────────────────────
+// ── extraction (verbatim) ─────────────────────────────────────────────
 
 function usable(el) {
   if (el.closest(`#${WRAP_ID}`)) return false;
@@ -77,7 +81,9 @@ function lastReply() {
   return null;
 }
 
-// innerText of a detached clone (buttons/SVGs stripped — including OUR injected ones)
+// Rendered text of a detached clone. button/svg/[aria-hidden] nodes are
+// removed (this strips the site's chrome AND our own injected buttons) —
+// otherwise the text is sent exactly as the page renders it.
 function elText(el) {
   const c = el.cloneNode(true);
   c.querySelectorAll("button, svg, [aria-hidden='true']").forEach(n => n.remove());
@@ -222,7 +228,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
 });
 
-// ── floating button (sends the LAST reply, unchanged behavior) ────────
+// ── floating button (sends the LAST reply) ────────────────────────────
 
 let wrap = null;
 async function syncButton() {

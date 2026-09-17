@@ -143,8 +143,8 @@ the async sendResponse.
     newest reply.
 4.  elText(): clone the element, remove all button/svg/[aria-hidden] nodes
     (this also removes our own injected buttons), attach the clone offscreen,
-    read innerText, remove the clone. Rendered text is captured, not original
-    markdown (see §12.4).
+    read innerText, remove the clone. The text is sent VERBATIM — the
+    extension performs no filtering or transformation (see §12.4).
 5.  Wrap into payload {text, source, url, ts}.
 
 ### 5.5 Per-message buttons
@@ -263,6 +263,8 @@ server-clj/config.json. Default mode on first run: save.
     via (apply str (repeat 3 (char 96))) instead of written literally, so the
     source file contains no fence sequence that markdown tooling could
     misinterpret (lesson learned — see git history).
+    The regex anchors fences to the BEGINNING OF A LINE only — fence-like
+    sequences mid-line are treated as plain text (§12.4).
 2.  :text segments → fmt-text: headings bold; blockquotes italic/dim;
     bullets (- * +) → •; horizontal rules dimmed; inline code cyan; bold /
     italic / link syntax styled inline.
@@ -439,11 +441,19 @@ Mode control (Clojure):
 3.  Chat DOMs drift. SITE_RULES carries per-site selectors (data-* and role
     hooks preferred), GENERIC fallbacks cover unknown/broken sites, and the
     corner-button fallback depends only on the message element itself.
-4.  Extraction captures RENDERED text (innerText of a cleaned clone), not
-    the original markdown. Consequence: server-side markdown rendering
-    (Clojure active mode) operates on the page's rendering; fenced code
-    blocks survive intact because they render verbatim, but emphasis/nested
-    structures may be normalized.
+4.  POLICY: the extension captures RENDERED text (innerText of a cleaned
+    clone) and sends it VERBATIM — no filtering or transformation in the
+    plugin; the server owns all interpretation. A DOM-to-markdown
+    reconstruction was attempted and rolled back. Consequences: browser
+    captures contain NO fence tokens (sites render code blocks as styled
+    preformatted text plus a bare language label such as "bash"), so
+    Clojure active mode displays such captures without execution prompts;
+    saved files show the label line verbatim. Text that genuinely contains
+    fences (copy-button pastes, curl tests, hand-edited files) is
+    processed normally — and fence detection anchors to the BEGINNING OF
+    A LINE only: mid-line fence-like sequences are plain text and can
+    never trigger execution. If re-fencing is ever needed, it belongs in
+    a server-side normalizer BEFORE split-segments, not in the plugin.
 5.  Text is captured at click time; sending during streaming captures a
     partial reply.
 6.  Firefox is not configured out of the box: it needs

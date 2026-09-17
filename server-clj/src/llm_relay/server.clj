@@ -126,7 +126,14 @@
 (def ^:private fence (apply str (repeat 3 (char 96))))
 
 (def ^:private fence-re
-  (re-pattern (str fence "([^\\n\\r]*)\\r?\\n([\\s\\S]*?)" fence)))
+  ;; Fences are recognized ONLY at the beginning of a line (?m): both the
+  ;; opening and the closing marker must start a line. Fence-like sequences
+  ;; in the middle of a line are plain text and can never introduce an
+  ;; executable block. (Policy: the extension sends text verbatim; all
+  ;; interpretation lives here, on the server.)
+  (re-pattern (str "(?m)^" fence "([^\\n\\r]*)\\r?\\n"
+                   "([\\s\\S]*?)"
+                   "^" fence "[ \\t]*")))
 
 (defn- split-segments
   "Split text into ordered {:kind :text|:code :lang ... :text ...} segments.

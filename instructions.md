@@ -1,229 +1,96 @@
-Two things currently tie the Clojure server to its own directory:
+Right — that change was never committed, so git revert had nothing to find; it only existed in your working tree. Overwriting content.js with the file below removes it completely. This is the final client, verbatim-capture edition: everything accumulated so far (per-message ⇪ buttons, DeepSeek toolbar candidates + visibility gating, on-demand injection support, floating button, toasts) and no markdown reconstruction anywhere — text is sent exactly as rendered, server owns all interpretation.
 
-1. **The Clojure CLI itself** — `clojure -M -m llm-relay.server` only finds the code if a `deps.edn` sits in the launch directory (that's why the Makefile does `cd server-clj` first).
-2. **The `project-root` hack in `server.clj`** — it resolves saves against the *parent* of the working directory, an assumption that breaks the moment you launch from anywhere else.
+From the repo root:
 
-Both are fixed below. New model: **home = the directory you launch from**. `config.json` is read/created there, relative `save-path`s resolve there. A small launcher script makes the code runnable from any directory.
+bash
+cat > extension/content.js << 'JSEOF'
 
-## 1 · Patch `server.clj` — home-dir semantics
 
-```bash
-python3 - << 'EOF'
-import pathlib
-f = pathlib.Path("server-clj/src/llm_relay/server.clj")
-t = f.read_text()
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg?.type === "llr-extract") {
+    const found = extract();
+    if (!found) { sendResponse({ ok: false, error: "no reply found on this page" }); return; }
+    sendResponse({ ok: true, payload: buildPayload(found.text), chars: found.text.length });
+    return;
+  }
+  if (msg?.type === "llr-status") {
+    toast(msg.ok ? `✅ Sent ${msg.chars} chars` : `⚠️ ${msg.error}`);
+  }
+});
 
-old = '''(def config-file
-  (io/file (or (System/getProperty "llm-relay.config") "config.json")))'''
-new = '''(def ^:private home-dir
-  "The HOME of this server instance: the directory the process was
-   LAUNCHED from. config.json is read/created here and relative
-   :save-path values resolve against it. Override with LLM_RELAY_HOME
-   (env) or -Dllm-relay.home=... (system property)."
-  (.getAbsoluteFile
-   (io/file (or (System/getProperty "llm-relay.home")
-                (System/getenv "LLM_RELAY_HOME")
-                "."))))
 
-(def config-file
-  (io/file (or (System/getProperty "llm-relay.config")
-               (System/getenv "LLM_RELAY_CONFIG")
-               (io/file home-dir "config.json"))))'''
-assert old in t, "config-file block not found"
-t = t.replace(old, new, 1)
+// ── floating button (sends the LAST reply) ────────────────────────────
 
-old = '''(def ^:private project-root
-  "Parent of the server's working directory — the repo root in a normal
-   clone. Relative :save-path values resolve against it."
-  (or (.getParentFile (.getAbsoluteFile (io/file ".")))
-      (io/file ".")))
 
-(defn- save-path [cfg]
-  (let [p (str (or (:save-path cfg) "instructions.md"))]
-    (if (.isAbsolute (io/file p))
-      p
-      (str (io/file project-root p)))))'''
-new = '''(defn- save-path
-  "Absolute save target: :save-path as-is when absolute, else resolved
-   against home-dir — the launch directory."
-  [cfg]
-  (let [p (str (or (:save-path cfg) "instructions.md"))]
-    (if (.isAbsolute (io/file p))
-      p
-      (str (io/file home-dir p)))))'''
-assert old in t, "project-root block not found"
-t = t.replace(old, new, 1)
+let wrap = null;
+async function syncButton() {
+  const { showButton = true } = await chrome.storage.sync.get({ showButton: true });
+  if (showButton && !wrap) {
+    wrap = document.createElement("div");
+    wrap.id = WRAP_ID;
+    const btn = document.createElement("div");
+    btn.textContent = "⇪ Send last reply";
+    Object.assign(btn.style, {
+      position: "fixed", right: "16px", bottom: "16px", zIndex: 2147483647,
+      padding: "8px 14px", borderRadius: "20px", cursor: "pointer",
+      background: "#111827", color: "#fff", font: "13px system-ui, sans-serif",
+      boxShadow: "0 2px 8px rgba(0,0,0,.35)", opacity: "0.85", userSelect: "none",
+    });
+    btn.addEventListener("click", () => {
+      const found = extract();
+      if (!found) { toast("❌ No reply found on this page"); return; }
+      sendText(found.text, "last reply");
+    });
+    wrap.appendChild(btn);
+    document.body.appendChild(wrap);
+  } else if (!showButton && wrap) {
+    wrap.remove();
+    wrap = null;
+  }
+}
+chrome.storage.onChanged.addListener(syncButton);
+syncButton();
+startObserver();
 
-old = '''    (println (str "  saves to: " (save-path @config)'''
-new = '''    (println (str "  home    : " (.getAbsolutePath home-dir)))
-    (println (str "  saves to: " (save-path @config)'''
-assert old in t, "banner line not found"
-t = t.replace(old, new, 1)
 
-f.write_text(t)
-print("✓ server.clj: home = launch directory (config.json + relative saves)")
-EOF
+// ── toast ─────────────────────────────────────────────────────────────
 
-cd server-clj && clojure -M -e "(require 'llm-relay.server) (println :syntax-ok)"; cd ..
-```
 
-## 2 · Launcher: `bin/relay-clj` (the arbitrary-directory trick)
+let toastTimer;
+function toast(msgText) {
+  let el = document.getElementById(`${WRAP_ID}-toast`);
+  if (!el) {
+    el = document.createElement("div");
+    el.id = `${WRAP_ID}-toast`;
+    Object.assign(el.style, {
+      position: "fixed", right: "16px", bottom: "56px", zIndex: 2147483647,
+      padding: "8px 12px", borderRadius: "8px", background: "#111827",
+      color: "#fff", font: "13px system-ui, sans-serif", display: "none",
+    });
+    document.body.appendChild(el);
+  }
+  el.textContent = msgText;
+  el.style.display = "block";
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => (el.style.display = "none"), 2500);
+}
+JSEOF
 
-The launcher points the Clojure CLI at the project's `src` via `-Sdeps` with an **absolute path derived from the script's own location** — so no `deps.edn` is needed where you run it, and the CLI still resolves the jars from `~/.m2`:
 
-```bash
-mkdir -p bin
-cat > bin/relay-clj << 'EOF'
-#!/usr/bin/env bash
-# relay-clj — run the LLM Relay Clojure server from ANY directory.
-#
-# The launch directory becomes the server's HOME: config.json is read or
-# created there, and relative save paths (instructions.md) resolve
-# against it.
-#
-#   relay-clj                                     # home = current directory
-#   LLM_RELAY_CONFIG=/path/config.json relay-clj  # explicit config file
-#   LLM_RELAY_HOME=/path relay-clj                # explicit home directory
-#
-# Requires the clojure CLI on PATH. Dependency versions below must stay
-# in sync with server-clj/deps.edn — update both together.
-set -euo pipefail
+# sanity: reconstruction code must be gone, verbatim extractor present
+grep -c "mdSerialize\|contentOf\|FENCE" extension/content.js   # expect: 0
+grep -c "function elText" extension/content.js                 # expect: 1
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+Two small follow-ups:
 
-exec clojure -Sdeps "{:paths [\"${ROOT}/server-clj/src\"]
-                       :deps {org.clojure/clojure     {:mvn/version \"1.11.3\"}
-                              ring/ring-jetty-adapter {:mvn/version \"1.13.0\"}
-                              org.clojure/data.json   {:mvn/version \"2.5.0\"}}}" \
-       -M -m llm-relay.server "$@"
-EOF
-chmod +x bin/relay-clj
-```
+If the earlier instruction also bumped your manifest.json to "version": "1.0.1", that's cosmetic — safe to keep as-is (it just helps you confirm the reload took).
+Reload the extension: chrome://extensions → ↻ on LLM Relay → refresh a chat tab once.
 
-Optional — make it a global command:
+Then commit the clean state:
 
-```bash
-mkdir -p ~/.local/bin
-ln -sf "$PWD/bin/relay-clj" ~/.local/bin/relay-clj
-# then: cd ~/anywhere && relay-clj
-```
-
-## 3 · Makefile, gitignore, one-time migration
-
-```bash
-python3 - << 'EOF'
-import pathlib
-f = pathlib.Path("Makefile"); t = f.read_text()
-old = "run-clj:\n\tcd server-clj && clojure -M -m llm-relay.server\n"
-new = "run-clj:\n\t./bin/relay-clj\n"
-assert old in t, "run-clj target not found"
-f.write_text(t.replace(old, new)); print("✓ Makefile")
-EOF
-
-cat >> .gitignore << 'EOF'
-
-# clojure server may run with any launch directory as its home
-/config.json
-server-clj/llm-relay.jar
-EOF
-
-# one-time: carry over an existing customized config (else defaults are created)
-[ -f server-clj/config.json ] && [ ! -f config.json ] \
-  && cp server-clj/config.json config.json && echo "→ migrated server-clj/config.json to ./config.json" || true
-```
-
-`make run-clj` still behaves like before — make runs from the repo root, so home = repo root and `instructions.md` lands there as always.
-
-## 4 · Optional: uberjar (zero launcher magic, fastest startup)
-
-Build once, then `java -jar` from anywhere — no `clojure` CLI needed at runtime:
-
-```bash
-cat > server-clj/deps.edn << 'EOF'
-{:paths ["src"]
- :deps  {org.clojure/clojure        {:mvn/version "1.11.3"}
-         ring/ring-jetty-adapter    {:mvn/version "1.13.0"}
-         org.clojure/data.json      {:mvn/version "2.5.0"}}
- :aliases {:run   {:main-opts ["-m" "llm-relay.server"]}
-           :build {:deps {com.github.seancorfield/depstar {:mvn/version "2.1.303"}}
-                   :ns-default hf.depstar
-                   :exec-args {:jar "llm-relay.jar"
-                               :aot true
-                               :main-class llm-relay.server}}}}
-EOF
-
-cd server-clj && clojure -X:build && cd ..
-java -jar server-clj/llm-relay.jar     # launch dir = home, same rules
-```
-
-## 5 · Update DESIGN.md
-
-```bash
-python3 - << 'EOF'
-import pathlib
-f = pathlib.Path("DESIGN.md"); t = f.read_text()
-
-old = """-   Config is an atom loaded from config.json at STARTUP (differs from the
-    Python server's per-request reload). Hand-editing the file requires a
-    restart; changing mode via POST /mode persists immediately."""
-new = """-   Config is an atom loaded from config.json at STARTUP (differs from the
-    Python server's per-request reload). Hand-editing the file requires a
-    restart; changing mode via POST /mode persists immediately.
--   HOME = the directory the server process is LAUNCHED from. config.json
-    is read/created there and relative :save-path values resolve against
-    it. bin/relay-clj starts the server from any directory (it points the
-    Clojure CLI at the project sources via -Sdeps, so no deps.edn is
-    needed in the launch dir); overrides: LLM_RELAY_HOME and
-    LLM_RELAY_CONFIG env vars, or -Dllm-relay.home / -Dllm-relay.config.
-    make run-clj launches from the repo root, so its home is the repo
-    root. An uberjar (clojure -X:build in server-clj/) removes the CLI
-    dependency entirely: java -jar llm-relay.jar, same home rules."""
-assert old in t; t = t.replace(old, new, 1)
-
-old = "    make run-clj      # Clojure server (same port — run one at a time)"
-new = ("    make run-clj      # Clojure server from repo root (home = repo root)\n"
-       "    ./bin/relay-clj   # same server from ANY directory (home = that dir)")
-assert old in t; t = t.replace(old, new, 1)
-
-f.write_text(t); print("✓ DESIGN.md")
-EOF
-```
-
-## 6 · Verify
-
-```bash
-mkdir -p /tmp/relay-home && cd /tmp/relay-home
-/path/to/llm-relay/bin/relay-clj          # terminal 1
-```
-
-```bash
-cd /tmp/relay-home                        # terminal 2
-curl -s -X POST http://127.0.0.1:8765/send -H 'Content-Type: application/json' \
-     -d '{"text":"**launched from elsewhere**"}'
-cat instructions.md    # ← created HERE
-cat config.json        # ← created HERE (defaults)
-```
-
-The startup banner now tells you exactly what it decided:
-
-```
-  home    : /tmp/relay-home
-  saves to: /tmp/relay-home/instructions.md
-  config  : /tmp/relay-home/config.json
-```
-
-## 7 · Commit
-
-```bash
-git add server-clj/src/llm_relay/server.clj server-clj/deps.edn \
-        bin/relay-clj Makefile .gitignore DESIGN.md
-git commit -m "Clojure server: launch-directory home semantics; bin/relay-clj launcher for arbitrary directories; optional uberjar build"
+bash
+git add extension/content.js
+git commit -m "Client: verbatim text capture only — all filtering/interpretation lives server-side"
 git push
-```
 
-Notes:
-
-- **The launcher duplicates the dep versions** from `deps.edn` (a `-Sdeps` limitation). I put a sync reminder in both files; if that bothers you, the uberjar path eliminates the duplication — build once, run the jar.
-- **`server-clj/config.json` is now dormant** for `make run-clj` (home moved to repo root) — the migration line in step 3 copies it; delete it once you're happy.
-- **Windows:** `bin/relay-clj` is bash — use WSL/Git Bash, or just `java -jar` (option 4), which works from `cmd`/PowerShell.
-- The Python server was left untouched deliberately: it's location-independent already (config lives next to the script, saves default to the repo root). If you'd rather have Python adopt the same launch-directory semantics, it's a two-line change to `CONFIG_FILE` and `instructions_path` — say the word.
+Expected behavior after this, so we're aligned: saved instructions.md from a browser capture contains the bare bash label lines and no fence characters (that is the verbatim page text), while anything that genuinely contains line-start fences (copy-button pastes, curl, hand-edited files) is preserved exactly and — in the Clojure active mode from the previous step — gated at line starts only.
