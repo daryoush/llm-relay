@@ -24,6 +24,10 @@ const SITE_RULES = [
   {
     match: h => h === "chat.deepseek.com",
     selectors: ["div.ds-markdown", '[class*="ds-markdown"]', ".markdown-body"],
+    // DeepSeek builds its hover icon-row lazily and uses hashed classes —
+    // try these known bar shapes first, else fall back to the corner button
+    toolbars: ['[class*="ds-chat-message__action"]',
+               '[class*="chat-message"] [class*="action"]'],
   },
   {
     match: h => /(^|\.)kimi\.com$/.test(h) || h === "kimi.moonshot.cn",
@@ -105,16 +109,18 @@ async function sendText(text, label) {
 
 // ── per-message buttons in the site's action bar ──────────────────────
 
+const isVisible = el => !!(el.offsetParent || el.getClientRects().length);
+
 function findToolbar(msg, rule) {
-  // 1) exact selector if the rule provides one
-  if (rule?.toolbar) {
+  // 1) explicit selectors from the site rule, in order — must be VISIBLE
+  const explicit = rule?.toolbars || (rule?.toolbar ? [rule.toolbar] : []);
+  for (const sel of explicit) {
     for (let el = msg.parentElement, i = 0; el && i < 6; i++, el = el.parentElement) {
-      const t = el.querySelector(rule.toolbar);
-      if (t) return t;
+      for (const t of el.querySelectorAll(sel)) if (isVisible(t)) return t;
     }
   }
   // 2) heuristic: nearest following sibling (walking up a few levels) that is a
-  //    small button row — but never a sibling that IS/CONTAINS another message
+  //    small, visible button row — never another message, never the composer
   const sels = rule?.selectors || [];
   const hasMsg = n => {
     try { return sels.some(s => n.matches(s) || n.querySelector(s)); } catch { return false; }
@@ -124,7 +130,11 @@ function findToolbar(msg, rule) {
     let sib = el.nextElementSibling;
     while (sib) {
       const n = sib.querySelectorAll("button").length;
-      if (n >= 1 && n <= 12 && !sib.querySelector("pre") && !hasMsg(sib)) return sib;
+      if (n >= 1 && n <= 12
+          && !sib.querySelector("pre")
+          && !sib.querySelector('textarea, [contenteditable="true"]')
+          && isVisible(sib)
+          && !hasMsg(sib)) return sib;
       sib = sib.nextElementSibling;
     }
     el = el.parentElement;
