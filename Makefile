@@ -1,10 +1,7 @@
-.PHONY: run config test run-clj context
+.PHONY: run test run-clj context install
 
-config:
-	@test -f server/config.json || cp server/config.example.json server/config.json
-
-run: config
-	python3 server/llm_relay_server.py
+run:
+	./bin/llm-relay
 
 test:
 	@curl -s -X POST http://127.0.0.1:8765/send \
@@ -16,3 +13,9 @@ run-clj:
 
 context:
 	./bin/repo-context.sh
+
+install:
+	mkdir -p $(HOME)/.local/bin
+	ln -sf $(CURDIR)/bin/llm-relay $(HOME)/.local/bin/llm-relay
+	ln -sf $(CURDIR)/bin/run-md $(HOME)/.local/bin/run-md
+	ln -sf $(CURDIR)/bin/run-llm $(HOME)/.local/bin/run-llm

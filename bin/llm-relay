@@ -1,30 +1,48 @@
 #!/usr/bin/env python3
 """
-LLM Relay Server (Python).
+LLM Relay Server (Python) — command-line configured; there is no config file.
 
 Default behavior on every received message:
   1. PRINT the text to this console
-  2. SAVE it to instructions.md (project root by default)
+  2. SAVE it to the save target (./instructions.md by default)
 
-Stdlib only, Python 3.7+. Run:  make run   (or python3 server/llm_relay_server.py)
+Stdlib only, Python 3.7+.
 
-config.json is auto-created next to this file and re-read on EVERY request,
-so config changes need no restart.
+Run it from ANY directory — the LAUNCH DIRECTORY is the instance home:
+relative --save-path values resolve against it, and debug_payload.jsonl
+is written there.
+
+Install (optional):
+  make install      # symlinks bin/llm-relay, bin/run-md, bin/run-llm
+                    # into ~/.local/bin
+
+Settings are command-line arguments only (defaults shown):
+
+  --host 127.0.0.1              bind address
+  --port 8765                   listen port
+  --token ""                    require header X-Relay-Token when non-empty
+  --command print-save          print-save | show | save | popup | shell command
+  --save-path instructions.md   relative paths resolve against the launch dir
+  --append                      append with a --- separator instead of overwriting
+  --max-length 200000           truncate longer payloads (0 disables)
+  --no-debug-payload            do not append raw request bodies to
+                                ./debug_payload.jsonl
 
 commands:
-  "print-save"  print to console AND save to save_path     (default)
+  "print-save"  print to console AND save          (default)
   "show"        print to console only
   "save"        save only
   "popup"       desktop window with the text (tkinter)
   anything else run as a shell command ({content} substitution or stdin)
 
-debug_payload (true by default): the RAW HTTP body of every /send request is
-appended to debug_payload.jsonl next to this script. Compare that file with
-the saved instructions.md to determine whether text was changed in the
-CLIENT (raw payload already differs from the page's original markdown) or
-in the SERVER (raw payload fine, saved file differs — would be a bug).
+debug_payload (on by default): the RAW HTTP body of every /send request is
+appended to debug_payload.jsonl in the launch directory. Compare that file
+with the saved instructions.md to determine whether text was changed in
+the CLIENT (raw payload already differs from the page's original markdown)
+or in the SERVER (raw payload fine, saved file differs — would be a bug).
 """
 
+import argparse
 import json
 import os
 import shlex
@@ -34,49 +52,43 @@ import threading
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(BASE_DIR)
-CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
-DEBUG_FILE = os.path.join(BASE_DIR, "debug_payload.jsonl")
-
-DEFAULT_CONFIG = {
-    "host": "127.0.0.1",
-    "port": 8765,
-    "token": "",                 # optional secret; requests must send X-Relay-Token
-    "command": "print-save",     # print-save (default) | show | save | popup | shell cmd
-    "save_path": "instructions.md",  # relative paths resolve against the PROJECT ROOT
-    "save_append": False,        # true -> append, separated by a --- rule
-    "debug_payload": True,       # append raw request bodies to debug_payload.jsonl
-    "max_length": 200000,        # truncate huge payloads (None to disable)
-}
+CFG = {}      # effective settings, built once in main()
+HOME = ""     # launch directory; set in main()
 
 
-def load_config():
-    cfg = dict(DEFAULT_CONFIG)
-    try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            cfg.update(json.load(f))
-    except FileNotFoundError:
-        save_config(DEFAULT_CONFIG)
-    except Exception as exc:
-        print(f"[config] could not read {CONFIG_FILE}: {exc} — using defaults", flush=True)
-    return cfg
+def parse_args():
+    p = argparse.ArgumentParser(
+        prog="llm-relay",
+        description="LLM Relay server — receives text POSTed by the browser "
+                    "extension, prints and/or saves it. No config file; "
+                    "every setting is a command-line argument.")
+    p.add_argument("--host", default="127.0.0.1",
+                   help="bind address (default: 127.0.0.1)")
+    p.add_argument("--port", type=int, default=8765,
+                   help="listen port (default: 8765)")
+    p.add_argument("--token", default="",
+                   help="require header X-Relay-Token when non-empty")
+    p.add_argument("--command", default="print-save",
+                   help="print-save | show | save | popup | any shell command "
+                        "(default: print-save)")
+    p.add_argument("--save-path", default="instructions.md", dest="save_path",
+                   help="save target; relative paths resolve against the "
+                        "launch directory (default: instructions.md)")
+    p.add_argument("--append", action="store_true",
+                   help="append with a --- separator instead of overwriting")
+    p.add_argument("--max-length", type=int, default=200000, dest="max_length",
+                   help="truncate longer payloads; 0 disables (default: 200000)")
+    p.add_argument("--no-debug-payload", action="store_true",
+                   help="do not append raw request bodies to debug_payload.jsonl")
+    return p.parse_args()
 
 
-def save_config(cfg):
-    try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2)
-    except Exception as exc:
-        print(f"[config] could not write {CONFIG_FILE}: {exc}", flush=True)
-
-
-def instructions_path(cfg):
-    """Absolute save target: absolute save_path as-is; relative against the
-    project root (the parent directory of server/)."""
-    p = os.path.expanduser(str(cfg.get("save_path") or "instructions.md"))
+def instructions_path():
+    """Absolute save target: absolute --save-path as-is; relative against
+    the launch directory (home)."""
+    p = os.path.expanduser(str(CFG.get("save_path") or "instructions.md"))
     if not os.path.isabs(p):
-        p = os.path.join(PROJECT_ROOT, p)
+        p = os.path.join(HOME, p)
     return os.path.abspath(p)
 
 
@@ -88,12 +100,12 @@ def cmd_print(text, meta):
           f"  |  {len(text)} chars\n{bar}\n{text}\n{bar}\n", flush=True)
 
 
-def save_message(text, cfg):
-    path = instructions_path(cfg)
+def save_message(text):
+    path = instructions_path()
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    append = bool(cfg.get("save_append"))
+    append = bool(CFG.get("save_append"))
     sep = ""
     if append and os.path.exists(path) and os.path.getsize(path) > 0:
         sep = "\n\n---\n\n"
@@ -107,17 +119,17 @@ def dump_payload(raw, source):
     """Append the exact HTTP body received — the ground truth of what the
     client sent. Never let debug failures affect the response."""
     try:
-        with open(DEBUG_FILE, "a", encoding="utf-8") as f:
+        with open(os.path.join(HOME, "debug_payload.jsonl"), "a", encoding="utf-8") as f:
             f.write(json.dumps({
                 "ts": datetime.now().isoformat(timespec="seconds"),
                 "source": source,
                 "raw": raw,
             }) + "\n")
     except Exception as exc:
-        print(f"[debug] could not write {DEBUG_FILE}: {exc}", flush=True)
+        print(f"[debug] could not write debug_payload.jsonl: {exc}", flush=True)
 
 
-def cmd_popup(text, meta):
+def cmd_popup(text):
     code = (
         "import sys, tkinter as tk\n"
         "t = sys.stdin.read()\n"
@@ -152,17 +164,17 @@ def spawn(cmd, text=None, shell=False):
         threading.Thread(target=feed, daemon=True).start()
 
 
-def run_command(cfg, text, meta):
-    command = cfg.get("command") or "print-save"
+def run_command(text, meta):
+    command = CFG.get("command") or "print-save"
     if command == "print-save":
         cmd_print(text, meta)
-        save_message(text, cfg)
+        save_message(text)
     elif command == "save":
-        save_message(text, cfg)
+        save_message(text)
     elif command == "show":
         cmd_print(text, meta)
     elif command == "popup":
-        cmd_popup(text, meta)
+        cmd_popup(text)
     else:
         cmd_shell(command, text)
 
@@ -191,13 +203,11 @@ class RelayHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
-        cfg = load_config()  # live config: re-read on every request
-
         if self.path.split("?")[0].rstrip("/") not in ("", "/send"):
             self._reply(404, {"ok": False, "error": f"unknown path {self.path}"})
             return
 
-        if cfg.get("token") and self.headers.get("X-Relay-Token") != cfg["token"]:
+        if CFG.get("token") and self.headers.get("X-Relay-Token") != CFG["token"]:
             self._reply(401, {"ok": False, "error": "missing or bad X-Relay-Token"})
             return
 
@@ -217,7 +227,7 @@ class RelayHandler(BaseHTTPRequestHandler):
         except (ValueError, TypeError):
             pass  # raw text body is also accepted
 
-        if cfg.get("debug_payload", True):
+        if CFG.get("debug_payload", True):
             dump_payload(raw, source)
 
         text = text.strip()
@@ -225,14 +235,14 @@ class RelayHandler(BaseHTTPRequestHandler):
             self._reply(400, {"ok": False, "error": "empty text"})
             return
 
-        limit = cfg.get("max_length")
+        limit = CFG.get("max_length")
         if limit and len(text) > limit:
             text = text[:limit]
 
         meta = {"source": source,
                 "received_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
         try:
-            run_command(cfg, text, meta)
+            run_command(text, meta)
             self._reply(200, {"ok": True})
         except Exception as exc:
             self._reply(500, {"ok": False, "error": repr(exc)})
@@ -242,18 +252,30 @@ class RelayHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    cfg = load_config()
-    host, port = cfg.get("host", "127.0.0.1"), int(cfg.get("port", 8765))
-    httpd = ThreadingHTTPServer((host, port), RelayHandler)
+    global CFG, HOME
+    args = parse_args()
+    HOME = os.getcwd()
+    CFG = {
+        "host": args.host,
+        "port": args.port,
+        "token": args.token,
+        "command": args.command,
+        "save_path": args.save_path,
+        "save_append": args.append,
+        "max_length": args.max_length if args.max_length and args.max_length > 0 else None,
+        "debug_payload": not args.no_debug_payload,
+    }
+    httpd = ThreadingHTTPServer((CFG["host"], int(CFG["port"])), RelayHandler)
     print("─" * 60)
     print(" LLM Relay Server (Python)")
-    print(f"   ->  http://{host}:{port}/send")
-    print(f"   command : {cfg.get('command')!r}")
-    print(f"   saves to: {instructions_path(cfg)}"
-          + ("  (appending)" if cfg.get("save_append") else ""))
-    print(f"   debug   : raw payloads -> {DEBUG_FILE}"
-          if cfg.get("debug_payload", True) else "   debug   : off")
-    print(f"   token   : {'enabled' if cfg.get('token') else 'disabled'}")
+    print(f"   ->  http://{CFG['host']}:{CFG['port']}/send")
+    print(f"   command : {CFG['command']!r}")
+    print(f"   home    : {HOME}   (launch directory)")
+    print(f"   saves to: {instructions_path()}"
+          + ("  (appending)" if CFG["save_append"] else ""))
+    print(f"   debug   : raw payloads -> {os.path.join(HOME, 'debug_payload.jsonl')}"
+          if CFG["debug_payload"] else "   debug   : off")
+    print(f"   token   : {'enabled' if CFG['token'] else 'disabled'}")
     print("─" * 60 + "\n", flush=True)
     try:
         httpd.serve_forever()

@@ -13,7 +13,7 @@ echo
 echo "## git status"; git status --short; echo
 echo "## git log (last 15)"; git log --oneline -15; echo
 
-code=$(git ls-files | grep -Ev "$EXCLUDE_RE" | grep -E '\.(py|js|json|edn|clj|html)$|^(Makefile|\.gitignore|bin/relay-clj)$' || true)
+code=$(git ls-files | grep -Ev "$EXCLUDE_RE" | grep -E '\.(py|js|json|edn|clj|html)$|^(Makefile|\.gitignore|bin/relay-clj|bin/llm-relay|bin/run-md)$' || true)
 docs=$(git ls-files | grep -Ev "$EXCLUDE_RE" | grep -E '\.md$' || true)
 
 while IFS= read -r f; do

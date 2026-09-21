@@ -5,6 +5,6 @@
   "command": "print-save",
   "save_path": "instructions.md",
   "save_append": false,
-  "debug_payload": true,
-  "max_length": 200000
+  "max_length": 200000,
+  "debug_payload": true
 }

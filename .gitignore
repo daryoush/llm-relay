@@ -1,25 +1,20 @@
-# local config may contain the shared token — never commit it
-server/config.json
+# clojure runtime config (may hold token; local only). The Python server
+# no longer has any config file — settings are command-line arguments.
+/config.json
+server-clj/config.json
 
 __pycache__/
 *.pyc
 .DS_Store
 *.crswap
-
-# default save target for received messages (remove this line to track it in git)
-instructions.md
-
-# clojure server may run with any launch directory as its home
-/config.json
-server-clj/llm-relay.jar
-
-# raw request dump (diagnostics)
-server/debug_payload.jsonl
-
 *.cpcache
+
+# runtime outputs, at any level (home = wherever a server was launched)
+instructions.md
+debug_payload.jsonl
+
+# clojure uberjar
+server-clj/llm-relay.jar
 
 # chat transcripts / scratch pads — local only
 how-to-synch.md
-
-# clojure runtime config (may hold token; local only)
-server-clj/config.json
