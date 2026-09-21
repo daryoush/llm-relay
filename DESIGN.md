@@ -1,53 +1,64 @@
 # LLM Relay — Design Document
 
-Version: 1.1 · See README.md for installation; this document explains how the
+Version: 1.2 · See README.md for installation; this document explains how the
 system works, why it is built this way, and where to make changes. It is
 written to serve as complete context for a new user *or* an LLM agent.
+Code blocks in this document are indented, not fenced, so the file contains
+no fence sequences that markdown tooling could misinterpret.
 
 ## 0. Current state (v1.3.0)
 
-The extension is a CLIPBOARD PIPE: the user copies the text they want
-(the site's copy button yields raw markdown with code fences), then
-triggers a send (popup / floating button / hotkey / context menu). The
-clipboard content is relayed verbatim. DOM-based extraction of "the last
-reply" was removed after field testing showed rendered page text does
-not contain fence markers on several sites. See §5 for historical
-extraction details (superseded), §12 for the investigation record.
+The extension is a CLIPBOARD PIPE: the user copies the text they want (the
+site's copy button yields raw markdown with code fences intact), then
+triggers a send (popup with preview / floating button / hotkey / context
+menu). The clipboard content is relayed VERBATIM. Earlier DOM-based
+extraction of "the last reply" was removed after field testing showed
+rendered page text does not contain fence markers on several sites (see
+§12.3 for the full history). Servers print and/or save the text; a
+companion tool, tools/run-md.py, can later walk a saved file and execute
+its bash blocks with per-block approval.
 
 ## 1. Purpose
 
-LLM Relay captures LLM chat replies in the browser and hands them to a small
-local server that runs a configurable action on the text.
+LLM Relay carries text the user has copied in the browser to a small local
+server that runs a configurable action on it.
 
 Typical uses:
 
--   Persist the latest reply as instructions.md (the default action on
-    both servers).
--   Display the reply outside the browser (console, desktop window).
--   Pipe LLM output into local scripts, a log file, or the clipboard.
--   (Clojure server, active mode) review and selectively execute bash code
-    blocks contained in the reply, with per-block approval.
+-   Persist a captured reply as instructions.md (default on both servers).
+-   Display the text outside the browser (console, desktop window).
+-   Pipe it into local scripts, a log file, or the clipboard via a shell
+    command configured on the server.
+-   (Clojure server, active mode; tools/run-md.py) review and selectively
+    execute bash code blocks contained in the text, with per-block approval.
 
 Design principles:
 
 1.  Everything stays local: loopback HTTP, no cloud, no telemetry.
-2.  The browser cannot execute anything; only the local server can, and the
-    Clojure server only after an explicit human approval per block.
-3.  Both servers speak the same wire protocol, so the extension is agnostic
-    to which one is running.
+2.  The extension is a dumb pipe: it performs no filtering or
+    transformation. The server owns all interpretation of the content.
+3.  The browser cannot execute anything; only the local server can, and
+    only after an explicit human approval per code block (Clojure active
+    mode, run-md.py).
+4.  Both servers speak the same wire protocol, so the extension is
+    agnostic to which one is running.
 
 ## 2. Architecture
 
-    ┌──────────────────────────── Browser (Chromium) ────────────────────────────┐
-    │                                                                            │
-    │  chat page (chatgpt.com / claude.ai / gemini / deepseek / kimi / …)        │
-    │   └─ content.js      extraction · per-message ⇪ buttons · floating button  │
-    │        │             chrome.runtime message passing                        │
-    │        ▼                                                                   │
-    │  background.js (MV3 service worker)                                        │
-    │   └─ fetch POST            ← ALL network I/O happens here                  │
-    └──────────────────────────────┬─────────────────────────────────────────────┘
-                                   │  POST /send  {"text","source","url","ts"}
+    user copies text (site copy button = raw markdown incl. fences)
+                │
+                ▼
+    ┌──────────────────────────── Browser (Chromium) ───────────────────────┐
+    │                                                                       │
+    │  chat page (chatgpt.com / claude.ai / deepseek / kimi / …)            │
+    │   └─ content.js      floating "Send clipboard" button · toasts        │
+    │        │             chrome.runtime message passing                   │
+    │        ▼                                                              │
+    │  background.js (MV3 service worker)                                   │
+    │   ├─ chrome.scripting.executeScript: read the CLIPBOARD in the tab    │
+    │   └─ fetch POST            ← ALL network I/O happens here             │
+    └──────────────────────────────┬────────────────────────────────────────┘
+                                   │  POST /send {"text","capture","source","url","ts"}
                                    ▼
                         http://127.0.0.1:8765
              ┌─────────────────────────┴─────────────────────────┐
@@ -55,30 +66,36 @@ Design principles:
              │  server-clj/src/llm_relay/server.clj (Clojure)    │  of the two
              └─────────────────────────┬─────────────────────────┘
                                        ▼
-                               configured command
-        Python: show (echo) · popup window · any shell command
-        Clojure: default = echo · active = markdown render + approved bash exec
+                              configured action
+        Python : print-save (default) · show · save · popup · shell command
+        Clojure: save (default) · echo · active (markdown render + gated
+                 execution of fenced code blocks)
 
 ## 3. Repository layout
 
     llm-relay/
     ├── DESIGN.md                  this document
     ├── README.md                  quick start
-    ├── Makefile                   run / test / run-clj
+    ├── Makefile                   run / test / run-clj / context
+    ├── bin/
+    │   ├── relay-clj              Clojure server launcher (any directory)
+    │   └── repo-context.sh        emits the repo as one paste-able bundle
+    ├── tools/
+    │   └── run-md.py              run a saved .md file's bash blocks (asks first)
     ├── extension/                 MV3 extension, loaded unpacked
     │   ├── manifest.json          permissions, matches, shortcut, UI wiring
-    │   ├── background.js          service worker: relay fetch, commands, menus
-    │   ├── content.js             extraction rules, per-message UI, observer
-    │   ├── popup.html/.js         toolbar popup: send + status
+    │   ├── background.js          clipboard capture + relay fetch, commands, menus
+    │   ├── content.js             floating button + toasts (no extraction)
+    │   ├── popup.html/.js         clipboard preview + send
     │   └── options.html/.js       serverUrl / token / showButton + test send
-    ├── server/                    Python implementation (stdlib only)
-    │   ├── llm_relay_server.py
-    │   ├── config.example.json    committed template
-    │   └── config.json            runtime, gitignored (may hold token)
-    └── server-clj/                Clojure implementation (Ring + Jetty)
-        ├── deps.edn
-        ├── src/llm_relay/server.clj
-        └── config.json            runtime, gitignored
+    └── server/                    Python implementation (stdlib only)
+        ├── llm_relay_server.py
+        ├── config.example.json    committed template
+        └── config.json            runtime, gitignored (may hold token)
+
+    Also present after first run, all gitignored: instructions.md (save
+    target), server/debug_payload.jsonl (raw request log),
+    server-clj/config.json (Clojure runtime config), server-clj/llm-relay.jar.
 
 ## 4. Wire protocol
 
@@ -87,16 +104,18 @@ CORS headers allowing browser origins.
 
 | Method | Path  | Body                          | Success response       | Python | Clojure |
 |--------|-------|-------------------------------|------------------------|--------|---------|
-| POST   | /send | JSON {"text": "...", "source": "host"} or raw text body | 200 {"ok": true} | yes | yes |
+| POST   | /send | JSON {"text": "...", ...} or raw text body | 200 {"ok": true} | yes | yes |
 | POST   | /mode | {"mode": "save"/"echo"/"active"} (legacy "default" = alias of "save") | 200 {"ok": true, "mode": "..."} | no | yes |
 | GET    | /mode | —                             | 200 {"mode": "..."}    | no     | yes     |
 | OPTIONS| any   | —                             | 204 + CORS headers     | yes    | yes     |
 
 Payload fields sent by the extension:
 
--   text — the extracted reply (required)
--   source — page hostname
--   url — page URL (servers ignore this, kept for logging/future use)
+-   text — the clipboard content, verbatim (required)
+-   capture — how it was obtained: "clipboard" or "test" (diagnostics only;
+    servers ignore it)
+-   source — hostname of the active tab when the send was triggered
+-   url — page URL (servers ignore it, kept for diagnostics)
 -   ts — ISO timestamp (same)
 
 Errors: 400 empty text · 401 missing/bad X-Relay-Token · 404 unknown path ·
@@ -110,100 +129,71 @@ extension support this.
 
 ### 5.1 Manifest (MV3)
 
--   permissions: storage, contextMenus, scripting
--   host_permissions: http://127.0.0.1/*, http://localhost/*, plus one pattern
-    per supported chat site. Kimi uses wildcard patterns
-    (https://*.kimi.com/*, https://*.kimi.ai/*, https://*.moonshot.cn/*,
-    https://*.moonshot.ai/*) to cover all subdomains and TLD variants.
--   content_scripts: content.js at document_idle on the same site list
+-   permissions: storage, contextMenus, scripting, clipboardRead
+-   host_permissions: http://127.0.0.1/*, http://localhost/*, plus one
+    pattern per supported chat site (Kimi uses wildcard patterns covering
+    all subdomains and TLD variants). These exist for TWO things only:
+    injecting the floating button (content_scripts) and reading the
+    clipboard inside a tab via chrome.scripting.executeScript. The POPUP
+    path needs no host permissions and works on any page.
 -   commands: send-last-reply (suggested Alt+Shift+S; user-configurable at
-    chrome://extensions/shortcuts)
+    chrome://extensions/shortcuts) — sends the clipboard despite its
+    historical id
 -   action popup + options page
 
 ### 5.2 Component responsibilities
 
 | File          | Role                                                              |
 |---------------|-------------------------------------------------------------------|
-| background.js | The only component that talks to the relay server (fetch). Handles the keyboard command and context menu by asking the active tab's content script to extract, then relaying. Answers llr-relay / llr-test messages. |
-| content.js    | Runs inside chat pages. Knows how to find assistant messages (SITE_RULES + GENERIC selectors), renders the floating button and per-message ⇪ buttons, shows toasts. |
-| popup.js      | Manual send button for the active tab + status line + settings link. |
-| options.js    | Persists serverUrl, token, showButton in chrome.storage.sync; sends a test message. |
+| background.js | The only component that talks to the relay server (fetch). Reads the clipboard in the active tab (executeScript) for hotkey/context-menu/floating-button sends. Answers llr-relay / llr-send-clipboard / llr-test messages. |
+| content.js    | Runs on supported chat pages. Renders the floating "Send clipboard" button and toasts. Contains NO extraction logic. |
+| popup.js      | Reads the clipboard directly (extension page: permission auto-granted), shows a 140-char preview, sends on click. |
+| options.js    | Persists serverUrl, token, showButton in chrome.storage.sync; sends a fixed test message. |
 
 ### 5.3 Internal message contract
 
-| From → To             | type        | payload              | reply                                |
-|-----------------------|-------------|----------------------|--------------------------------------|
-| popup/hotkey/menu → content | llr-extract | —              | {ok, payload, chars} or {ok:false, error} |
-| content → background  | llr-relay   | {payload}            | {ok} or {ok:false, error}            |
-| background → content  | llr-status  | {ok, chars?, error?} | — (content shows toast)              |
-| options → background  | llr-test    | —                    | {ok} or {ok:false, error}            |
+| From → To             | type               | payload     | reply                                 |
+|-----------------------|--------------------|-------------|---------------------------------------|
+| content → background  | llr-send-clipboard | —           | {ok, text} or {ok:false, error}       |
+| popup → background    | llr-relay          | {payload}   | {ok} or {ok:false, error}             |
+| options → background  | llr-test           | —           | {ok} or {ok:false, error}             |
+| background → content  | llr-status         | {ok, detail?/error?} | — (content shows a toast)    |
 
-Note: llr-extract and llr-status handlers respond synchronously; llr-relay and
-llr-test return true from the listener to keep the message channel open for
-the async sendResponse.
+Note: listeners that respond asynchronously must return true from the
+onMessage listener to keep the channel open.
 
-### 5.4 Message extraction (content.js)
+### 5.4 Clipboard capture
 
-1.  Pick the site rule whose match() matches location.hostname (SITE_RULES).
-2.  Candidate selectors = rule.selectors first, then GENERIC fallbacks.
-3.  For each selector: querySelectorAll, filter with usable() — visible
-    (offsetParent or client rects), not inside our own UI wrapper, not inside
-    an editable/textarea/input — then keep only outermost elements (drop
-    nodes contained in another match). The LAST remaining element is the
-    newest reply.
-4.  elText(): clone the element, remove all button/svg/[aria-hidden] nodes
-    (this also removes our own injected buttons), attach the clone offscreen,
-    read innerText, remove the clone. The text is sent VERBATIM — the
-    extension performs no filtering or transformation (see §12.4).
-5.  Wrap into payload {text, source, url, ts}.
+Two paths, both reading the clipboard and nothing else:
 
-### 5.5 Per-message buttons
+1.  In-tab (floating button, hotkey, context menu): background injects
+    readClipInPage via chrome.scripting.executeScript. It first uses the
+    legacy document.execCommand("paste") into an offscreen textarea —
+    silent under the clipboardRead permission — and falls back to
+    navigator.clipboard.readText() (which may prompt once). If injection
+    is impossible (no host permission, protected page), the error suggests
+    using the popup instead.
+2.  Popup: navigator.clipboard.readText() directly — extension pages have
+    the permission auto-granted, so no prompt.
 
-Goal: a ⇪ button next to each reply's native copy/retry icons that sends
-THAT specific message (not just the newest).
+The captured text is sent verbatim. No trimming beyond JSON transport, no
+filtering, no transformation (§12.5).
 
-Placement strategy, in order:
+### 5.5 Trigger paths
 
-1.  Explicit: rule.toolbars selectors searched in the message's ancestor
-    chain (up to 6 levels), only if the found bar is visible.
-2.  Heuristic: walk up ≤5 ancestor levels; scan following siblings; accept a
-    container with 1–12 buttons, no <pre>, no composer controls, visible,
-    and not containing another message.
-3.  Fallback (always works): a corner button appended to the message itself,
-    positioned absolute top-right, shown on hover.
+1.  Toolbar popup → clipboard preview → "Send clipboard to server"
+2.  Floating "⇪ Send clipboard" button on chat pages
+3.  Keyboard shortcut (Alt+Shift+S default)
+4.  Page context menu → "Send clipboard to relay server"
+5.  Options page → "Send test message" (fixed text, skips the clipboard)
 
-Robustness details:
+All converge on background.js relay().
 
--   The button keeps a live reference to its message; on click it sends that
-    message's text (falling back to the newest reply if the site replaced
-    the node).
--   Click handler runs in capture phase to precede the site's own delegated
-    handlers; default is prevented.
--   A MutationObserver (debounced 300 ms) re-injects buttons after the site
-    re-renders; ensureButton is idempotent via a data-llr-btn marker.
--   Because elText strips buttons, injected UI can never leak into sent text.
--   Per-message UI is only injected on sites listed in SITE_RULES (the
-    GENERIC selectors are too broad to decorate safely); hotkey/popup/
-    floating button work on any page via GENERIC.
+### 5.6 Protected pages
 
-### 5.6 Trigger paths (all converge on the same relay call)
-
-1.  Toolbar popup → "Send last LLM reply"
-2.  Keyboard shortcut (Alt+Shift+S default)
-3.  Page context menu → "Send last LLM reply to server"
-4.  Floating button (bottom-right, sends newest reply)
-5.  Per-message ⇪ button (sends that reply)
-6.  Options page → "Send test message" (fixed text, skips extraction)
-
-### 5.7 On-demand content-script injection
-
-A tab opened BEFORE the extension was installed/reloaded has no content
-script, and messaging it fails. Both background.js and popup.js catch that
-failure, call chrome.scripting.executeScript({files: ["content.js"]}), and
-retry the message once. This requires the "scripting" permission and the
-host being covered by host_permissions — the reason host patterns must list
-every host the user may chat on (wildcards for Kimi). Protected pages
-(chrome://, web store) can never be injected and report a clear error.
+chrome:// pages, the Web Store, and similar cannot be injected into. The
+floating button does not appear there (no content script), and a hotkey
+send reports an error toast suggesting the popup, which works anywhere.
 
 ## 6. Python server (server/llm_relay_server.py)
 
@@ -220,14 +210,15 @@ Request handling (POST /send):
 
 1.  Token check (X-Relay-Token) if configured.
 2.  Body: JSON {"text","source"} preferred; a raw text body is accepted.
-3.  Trim; empty → 400. Truncate to max_length.
-4.  Dispatch on config command:
-    -   "save" (default): write the text to instructions.md and print a
-        one-line confirmation. Target path: save_path (default
-        "instructions.md"); relative paths resolve against the PROJECT
-        ROOT (parent of server/), absolute as-is. Overwrites by default;
-        save_append true appends, separated by a "---" rule.
-    -   "show": print a banner + the text to the server console.
+3.  Raw body optionally appended to server/debug_payload.jsonl
+    (debug_payload, default true) — the ground truth of what the client
+    sent, for pipeline diagnosis.
+4.  Trim; empty → 400. Truncate to max_length.
+5.  Dispatch on config command:
+    -   "print-save" (default): print a banner + the text to the console,
+        then save it (see below).
+    -   "save": save only.
+    -   "show": print only.
     -   "popup": run a small tkinter window (via python -c) that displays
         the text received on stdin.
     -   anything else: a shell command. If it contains the marker {content},
@@ -235,13 +226,19 @@ Request handling (POST /send):
         command runs with shell=True. Otherwise the text is piped to the
         command's stdin.
 
-Execution model: spawn() starts the child without waiting; if text is piped,
-a daemon thread writes stdin and closes it. A slow child can never block the
-HTTP response or other requests.
+Save semantics: target is save_path (default "instructions.md"); RELATIVE
+paths resolve against the PROJECT ROOT (the parent directory of server/),
+absolute paths as-is. Overwrites by default — the file holds the latest
+capture; save_append true appends, separated by a "---" rule.
+
+Execution model: spawn() starts a child without waiting; if text is piped,
+a daemon thread writes stdin and closes it. A slow child can never block
+the HTTP response or other requests.
 
 Example commands (config.json "command"):
 
-    "show"                          print to console (default)
+    "print-save"                    print + save (default)
+    "show"                          print to console
     "popup"                         desktop window
     "pbcopy" / "wl-copy" / "clip"   clipboard (macOS / Wayland / Windows)
     "cat >> llm_log.txt"            append to file
@@ -254,7 +251,7 @@ Same /send protocol; additionally /mode.
 
 ### 7.1 Modes
 
--   save (default): the received text is written to instructions.md (§7.5)
+-   save (default): the received text is written to the save target (§7.5)
     and the console shows a one-line confirmation.
 -   echo: plain echo — banner, source, char count, raw text (the file is
     still saved).
@@ -264,17 +261,18 @@ Same /send protocol; additionally /mode.
 
 Mode is switched at runtime via POST /mode (save | echo | active; the
 legacy value "default" is accepted as an alias of save) and persisted to
-server-clj/config.json. Default mode on first run: save.
+the runtime config. Default mode on first run: save.
 
 ### 7.2 Markdown pipeline (active mode)
 
 1.  split-segments: the text is split into :text and :code segments by the
-    fenced-code regex. The fence token (three backticks) is BUILT at runtime
-    via (apply str (repeat 3 (char 96))) instead of written literally, so the
-    source file contains no fence sequence that markdown tooling could
-    misinterpret (lesson learned — see git history).
+    fenced-code regex. The fence token (three backticks) is BUILT at
+    runtime via (apply str (repeat 3 (char 96))) instead of written
+    literally, so the source file contains no fence sequence that markdown
+    tooling could misinterpret (lesson learned — see git history).
     The regex anchors fences to the BEGINNING OF A LINE only — fence-like
-    sequences mid-line are treated as plain text (§12.4).
+    sequences mid-line are treated as plain text (§12.4). tools/run-md.py
+    implements the same policy for saved files.
 2.  :text segments → fmt-text: headings bold; blockquotes italic/dim;
     bullets (- * +) → •; horizontal rules dimmed; inline code cyan; bold /
     italic / link syntax styled inline.
@@ -333,14 +331,13 @@ defmethods, never editing the core loop:
 -   Keys: host, port, token, mode, save-path, save-append,
     save-on-receive, exec-timeout-ms, max-length.
 
-### 7.5 Saving to instructions.md
+### 7.5 Saving
 
 The DEFAULT action on every received message is to persist the text:
 
 -   save-path (default "instructions.md"): relative paths resolve against
-    the project root (the parent directory of server-clj/); absolute
-    paths are used as-is. The resolved path is printed at startup and on
-    every save.
+    HOME — the launch directory (§7.4); absolute paths are used as-is.
+    The resolved path is printed at startup and on every save.
 -   Overwrite semantics by default — the file holds the latest capture.
     save-append true appends instead, separating captures with a "---"
     rule.
@@ -350,28 +347,29 @@ The DEFAULT action on every received message is to persist the text:
 
 server/config.json (Python):
 
-| key        | default | meaning                                        |
-|------------|---------|------------------------------------------------|
-| host       | 127.0.0.1 | bind address                                  |
-| port       | 8765    | listen port                                     |
-| token      | ""      | require X-Relay-Token when non-empty            |
-| command    | "save"  | save / show / popup / any shell command         |
-| save_path  | "instructions.md" | save target; relative → project root  |
-| save_append| false   | append with a "---" separator instead           |
-| max_length | 200000  | truncate longer payloads (null/None to disable) |
+| key          | default           | meaning                                          |
+|--------------|-------------------|--------------------------------------------------|
+| host         | 127.0.0.1         | bind address                                     |
+| port         | 8765              | listen port                                      |
+| token        | ""                | require X-Relay-Token when non-empty             |
+| command      | "print-save"      | print-save / save / show / popup / shell command |
+| save_path    | "instructions.md" | save target; relative → project root             |
+| save_append  | false             | append with a "---" separator instead            |
+| debug_payload| true              | append raw request bodies to debug_payload.jsonl |
+| max_length   | 200000            | truncate longer payloads (null to disable)       |
 
-server-clj/config.json (Clojure):
+server-clj/config.json (Clojure, local-only):
 
 | key             | default   | meaning                                  |
 |-----------------|-----------|------------------------------------------|
 | host / port     | 127.0.0.1 / 8765 | bind address / port                |
 | token           | ""        | shared secret                            |
 | mode            | "save"    | "save" (default) / "echo" / "active"; legacy "default" aliased to "save" |
-| save-path       | "instructions.md" | relative → project root          |
+| save-path       | "instructions.md" | relative → launch directory (home) |
 | save-append     | false     | append with a "---" separator instead    |
 | save-on-receive | true      | set false to disable file writing        |
-| exec-timeout-ms | 60000     | kill bash blocks after this long          |
-| max-length      | 200000    | payload truncation                        |
+| exec-timeout-ms | 60000     | kill code blocks after this long         |
+| max-length      | 200000    | payload truncation                       |
 
 Extension (chrome.storage.sync, edited in the options page):
 
@@ -387,26 +385,27 @@ Extension (chrome.storage.sync, edited in the options page):
 -   CORS is open (*) because the client is a browser extension/page; this
     means ANY page or app on the machine can POST to the port. When a shell
     command is configured, set a token (server config + extension options).
--   The extension never executes anything; it only sends text.
--   Clojure active mode: human approval is the only execution gate. Approved
-    scripts run locally with full user privileges — review before pressing y.
-    Timeouts kill runaway blocks; EOF fails closed (no execution).
--   config.json files are gitignored precisely because they can hold tokens;
-    config.example.json is the committed, secret-free template.
+-   The extension never executes anything; it only relays clipboard text.
+    It reads the clipboard ONLY on an explicit trigger (button, hotkey,
+    menu, popup); there is no background polling.
+-   Clojure active mode / run-md.py: human approval is the only execution
+    gate. Approved scripts run locally with full user privileges — review
+    before pressing y. Timeouts kill runaway blocks; EOF fails closed
+    (no execution).
+-   All config.json files (server/, server-clj/, and a root one created by
+    the Clojure server's home rules) are gitignored because they can hold
+    tokens; config.example.json is the committed, secret-free template.
 -   {content} substitution uses shlex.quote (POSIX). On Windows prefer
     stdin-style commands.
 
 ## 10. Extending
 
-Add a supported chat site:
+Add a supported chat site (floating button + in-tab clipboard read):
 
 1.  manifest.json: add match patterns to content_scripts.matches AND
     host_permissions (wildcards https://*.example.com/* cover all
-    subdomains).
-2.  content.js SITE_RULES: add {match: h => ..., selectors: [...],
-    toolbars: [...] (optional)}. Use DevTools to find a stable attribute
-    (data-* / role beats hashed classes).
-3.  Reload the extension; verify extraction via the popup or hotkey.
+    subdomains). The popup and its clipboard send work everywhere already.
+2.  Reload the extension.
 
 Change what happens to the text: edit the server config (Python: live;
 Clojure: restart, except mode via /mode).
@@ -422,17 +421,28 @@ server-clj/src/llm_relay/server.clj, then restart - e.g.
 To customize a language beyond the standard prompt/run flow, add an exact
 [:code "lang"] process-segment method (see section 7.3).
 
+Change fence handling: keep the LINE-START anchoring consistent across
+server-clj/src/llm_relay/server.clj (split-segments) and
+tools/run-md.py — mid-line fence-like sequences must stay plain text.
+
 ## 11. Development & testing workflow
 
     make run          # Python server (creates config.json on first run)
     make test         # curl POST a test message
     make run-clj      # Clojure server from repo root (home = repo root)
     ./bin/relay-clj   # same server from ANY directory (home = that dir)
+    make context      # emit repo state + sources as one paste-able bundle
+                      #   (pipe to pbcopy on macOS for LLM-grounded workflows)
+    python3 tools/run-md.py instructions.md
+                      # walk a saved file: renders markdown, asks before
+                      # executing each line-anchored bash block
+
+Ports collide on 8765 — run one server at a time or change config.
 
 Extension: chrome://extensions → Developer mode → Load unpacked → select
-extension/. After editing extension files: reload the card (↻); refreshing
-chat tabs is optional thanks to on-demand injection. After editing
-manifest.json (permissions/matches): reload AND refresh open chat tabs.
+extension/. After editing extension files: reload the card (↻); content
+scripts re-inject on the next tab load. After editing manifest.json:
+reload AND refresh open chat tabs.
 
 Mode control (Clojure):
 
@@ -448,34 +458,38 @@ Mode control (Clojure):
 2.  Two server implementations, one protocol. The extension does not know
     or care which is running. Ports collide on 8765 — run one at a time or
     change config.
-3.  Chat DOMs drift. SITE_RULES carries per-site selectors (data-* and role
-    hooks preferred), GENERIC fallbacks cover unknown/broken sites, and the
-    corner-button fallback depends only on the message element itself.
-4.  POLICY: the extension captures RENDERED text (innerText of a cleaned
-    clone) and sends it VERBATIM — no filtering or transformation in the
-    plugin; the server owns all interpretation. A DOM-to-markdown
-    reconstruction was attempted and rolled back. Consequences: browser
-    captures contain NO fence tokens (sites render code blocks as styled
-    preformatted text plus a bare language label such as "bash"), so
-    Clojure active mode displays such captures without execution prompts;
-    saved files show the label line verbatim. Text that genuinely contains
-    fences (copy-button pastes, curl tests, hand-edited files) is
-    processed normally — and fence detection anchors to the BEGINNING OF
-    A LINE only: mid-line fence-like sequences are plain text and can
-    never trigger execution. If re-fencing is ever needed, it belongs in
-    a server-side normalizer BEFORE split-segments, not in the plugin.
-5.  Text is captured at click time; sending during streaming captures a
-    partial reply.
-6.  Firefox is not configured out of the box: it needs
+3.  CLIPBOARD AS SOURCE OF TRUTH. The LLM's raw markdown lives in each
+    site's private app state; rendering CONSUMES the fence syntax, so
+    rendered DOM text on several sites contains no fence markers at all.
+    History: DOM extraction (inner-text) → DOM-to-markdown reconstruction
+    (rewrote text, rolled back) → automating the sites' copy buttons
+    (focus/permission fragility) → the current model: the USER copies via
+    the site's own copy button — which serializes the raw markdown — and
+    the extension relays the clipboard verbatim. Boring, but the only
+    stable public window into the same data the copy button uses.
+4.  FENCE POLICY: fence detection is anchored to the BEGINNING OF A LINE
+    in both the Clojure server (split-segments) and tools/run-md.py.
+    Mid-line fence-like sequences are plain text and can never introduce
+    an executable block. Fail-safe direction: a missed fence means
+    display-only, never unintended execution.
+5.  VERBATIM RELAY: whatever is on the clipboard is sent byte-for-byte.
+    If the user's copy action yields rendered text without fences (e.g.
+    manual selection copy), the relay preserves that too — the extension
+    does not second-guess the user.
+6.  Staleness is user-managed: the popup shows a 140-char clipboard
+    preview before sending, so "what am I about to relay" is always
+    visible. There is no streaming-capture problem because nothing is
+    captured from the page.
+7.  Firefox is not configured out of the box: it needs
     background.scripts instead of service_worker plus a gecko id in the
     manifest.
-7.  Unpacked installs require Chrome's Developer mode toggle (an install-
+8.  Unpacked installs require Chrome's Developer mode toggle (an install-
     time policy only, no runtime effect). Publishing unlisted to the Web
     Store removes the toggle for other machines.
-8.  Windows: the Clojure server shells out to bash (use WSL or Git Bash);
-    Python {content} quoting is POSIX-only.
-9.  max_length guards both servers against runaway payloads; the extension
+9.  Windows: the Clojure server and run-md.py shell out to bash (use WSL
+    or Git Bash); Python {content} quoting is POSIX-only.
+10. max_length guards both servers against runaway payloads; the extension
     has no client-side cap.
-10. The two servers deliberately differ on config semantics: Python re-reads
+11. The two servers deliberately differ on config semantics: Python re-reads
     config per request (live editing); Clojure loads at startup (mode is
     the runtime-switchable dimension, persisted via /mode).
