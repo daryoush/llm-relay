@@ -20,3 +20,6 @@ server/debug_payload.jsonl
 
 # chat transcripts / scratch pads — local only
 how-to-synch.md
+
+# clojure runtime config (may hold token; local only)
+server-clj/config.json
