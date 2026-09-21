@@ -1,4 +1,4 @@
-#!python3
+#!/usr/bin/env python3
 import re
 import subprocess
 import sys
@@ -36,7 +36,11 @@ def process_markdown_file(file_path):
 
     # Regex to find ```bash ... ``` blocks
     # re.DOTALL allows '.' to match newlines inside the code block
-    pattern = re.compile(r'```bash\s*(.*?)\s*```', re.DOTALL)
+    # Fences recognized ONLY at the beginning of a line (?m) - same policy
+    # as the relay servers (DESIGN.md section 12.4): mid-line fence-like
+    # sequences are plain text and can never introduce an executable block.
+    pattern = re.compile(r'^```bash[ \t]*\n(.*?)^```[ \t]*',
+                         re.DOTALL | re.MULTILINE)
 
     last_end = 0
     for match in pattern.finditer(content):
