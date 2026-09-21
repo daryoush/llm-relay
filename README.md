@@ -14,13 +14,13 @@ saves and/or acts on it.
     │   ├── background.js       clipboard capture; ALL network I/O lives here
     │   ├── content.js          floating "Send clipboard" button + toasts
     │   └── popup.* / options.*
-    ├── server/                 Python 3.7+, stdlib only
-    │   ├── llm_relay_server.py
-    │   ├── config.example.json committed template
-    │   └── config.json         created at runtime (gitignored — may hold token)
+    ├── bin/
+    │   ├── llm-relay           the Python server command (run anywhere)
+    │   ├── run-md              execute a .md file's bash blocks (asks first)
+    │   ├── run-llm             alias of run-md (symlink)
+    │   ├── relay-clj           Clojure server launcher (any directory)
+    │   └── repo-context.sh     emit the repo as one paste-able bundle
     ├── server-clj/             Clojure implementation (Ring + Jetty)
-    ├── bin/relay-clj           run the Clojure server from any directory
-    ├── tools/run-md.py         execute a saved .md file's bash blocks (asks first)
     └── DESIGN.md               full architecture & design decisions
 
 ## Sites
@@ -33,7 +33,7 @@ ChatGPT · Claude · Gemini · DeepSeek · Kimi · Qwen (Tongyi) · z.ai
 
 ## Quick start
 
-    make run          # starts the Python server, creates config.json on first run
+    make run          # starts the Python server (bin/llm-relay; CLI-arg settings)
     make test         # POSTs a test message with curl
     make run-clj      # alternative: the Clojure server (same port)
 
@@ -51,37 +51,41 @@ select the `extension/` folder.
 The clipboard content is relayed verbatim — the extension performs no
 extraction or filtering; the server owns all interpretation.
 
-## Configuration
+## Configuration (Python server)
 
-Server command is set in `server/config.json` and re-read on every request
-(no restart needed):
+There is no config file — every setting is a command-line argument with a
+built-in default:
 
-    "print-save"                      print to console AND save (default)
-    "save"                            save only
-    "show"                            print to the server console
-    "popup"                           desktop window (tkinter)
-    "pbcopy" / "wl-copy" / "clip"     clipboard (macOS / Wayland / Windows)
-    "cat >> llm_log.txt"              append to file
-    "python my_script.py {content}"   pass text as an argument
+    llm-relay [--host 127.0.0.1] [--port 8765] [--token T]
+              [--command print-save] [--save-path instructions.md]
+              [--append] [--max-length 200000] [--no-debug-payload]
 
-Other keys: save_path (default "instructions.md"; relative paths resolve
-against the project root), save_append (append with a --- separator),
-debug_payload (log raw request bodies to server/debug_payload.jsonl).
+    --command print-save                print to console AND save (default)
+    --command show                      print to the server console
+    --command save                      save only
+    --command popup                     desktop window (tkinter)
+    --command "cat >> llm_log.txt"      any shell command (text on stdin, or
+                                        {content} substituted, shell-quoted)
+    --command pbcopy                    clipboard (macOS; wl-copy / clip elsewhere)
 
-The Clojure server has its own local config (modes: save / echo / active;
-active renders markdown and asks before executing each fenced bash block —
-see DESIGN.md §7). Switch modes live:
+The LAUNCH DIRECTORY is the instance home: relative --save-path resolves
+against it and debug_payload.jsonl (raw request log) is written there.
+make run launches from the repo root.
 
-    curl -s -X POST http://127.0.0.1:8765/mode -d '{"mode":"active"}'
+Install the commands anywhere on PATH:
 
-To execute the bash blocks of a saved file later:
+    make install       # symlinks bin/llm-relay, bin/run-md, bin/run-llm
+                       # into ~/.local/bin (keep that on your PATH)
 
-    python3 tools/run-md.py instructions.md    # asks per block
+Then, from any directory:
 
-Extension settings (server URL, token, floating button) live in the
-extension's options page. If you set a `token` in a server config, put the
-same value in the extension options — config.json files are gitignored so
-tokens never get committed.
+    llm-relay          # the Python server
+    run-md FILE        # execute a saved .md file's bash blocks (asks first)
+    run-llm FILE       # alias of run-md
+
+The Clojure server (make run-clj / ./bin/relay-clj) keeps its own local
+config.json with modes save / echo / active — see DESIGN.md §7. If you
+set --token, put the same value in the extension options.
 
 ## Firefox
 

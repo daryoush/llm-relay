@@ -15,7 +15,7 @@ menu). The clipboard content is relayed VERBATIM. Earlier DOM-based
 extraction of "the last reply" was removed after field testing showed
 rendered page text does not contain fence markers on several sites (see
 §12.3 for the full history). Servers print and/or save the text; a
-companion tool, tools/run-md.py, can later walk a saved file and execute
+companion tool, bin/run-md, can later walk a saved file and execute
 its bash blocks with per-block approval.
 
 ## 1. Purpose
@@ -29,7 +29,7 @@ Typical uses:
 -   Display the text outside the browser (console, desktop window).
 -   Pipe it into local scripts, a log file, or the clipboard via a shell
     command configured on the server.
--   (Clojure server, active mode; tools/run-md.py) review and selectively
+-   (Clojure server, active mode; bin/run-md) review and selectively
     execute bash code blocks contained in the text, with per-block approval.
 
 Design principles:
@@ -76,26 +76,27 @@ Design principles:
     llm-relay/
     ├── DESIGN.md                  this document
     ├── README.md                  quick start
-    ├── Makefile                   run / test / run-clj / context
+    ├── Makefile                   run / test / run-clj / context / install
     ├── bin/
+    │   ├── llm-relay              the Python server command (run anywhere)
+    │   ├── run-md                 execute a .md file's bash blocks (asks first)
+    │   ├── run-llm                alias of run-md (symlink)
     │   ├── relay-clj              Clojure server launcher (any directory)
     │   └── repo-context.sh        emits the repo as one paste-able bundle
-    ├── tools/
-    │   └── run-md.py              run a saved .md file's bash blocks (asks first)
     ├── extension/                 MV3 extension, loaded unpacked
     │   ├── manifest.json          permissions, matches, shortcut, UI wiring
     │   ├── background.js          clipboard capture + relay fetch, commands, menus
     │   ├── content.js             floating button + toasts (no extraction)
     │   ├── popup.html/.js         clipboard preview + send
     │   └── options.html/.js       serverUrl / token / showButton + test send
-    └── server/                    Python implementation (stdlib only)
-        ├── llm_relay_server.py
-        ├── config.example.json    committed template
-        └── config.json            runtime, gitignored (may hold token)
+    └── server-clj/                Clojure implementation (Ring + Jetty)
+        ├── deps.edn
+        └── src/llm_relay/server.clj
 
-    Also present after first run, all gitignored: instructions.md (save
-    target), server/debug_payload.jsonl (raw request log),
-    server-clj/config.json (Clojure runtime config), server-clj/llm-relay.jar.
+    Runtime outputs (all gitignored): instructions.md and
+    debug_payload.jsonl are written to the launching directory. The
+    Clojure server keeps a local config.json per its home rules (§7.4);
+    the Python server has no config file at all (§6).
 
 ## 4. Wire protocol
 
@@ -195,30 +196,45 @@ chrome:// pages, the Web Store, and similar cannot be injected into. The
 floating button does not appear there (no content script), and a hotkey
 send reports an error toast suggesting the popup, which works anywhere.
 
-## 6. Python server (server/llm_relay_server.py)
+## 6. Python server (bin/llm-relay)
 
 Stdlib only (http.server). ThreadingHTTPServer → one thread per request.
+There is NO config file: all settings are command-line arguments with
+built-in defaults (the former config defaults).
 
-Config model:
+    llm-relay [--host H] [--port P] [--token T] [--command CMD]
+              [--save-path PATH] [--append] [--max-length N]
+              [--no-debug-payload]
 
--   config.json lives next to the script; auto-created from defaults on
-    first run (Makefile also copies config.example.json).
--   Re-read on EVERY request — editing the file changes behavior live, no
-    restart. This is intentional; the Clojure server differs here (§7.4).
+| flag               | default         | meaning                                    |
+|--------------------|-----------------|--------------------------------------------|
+| --host             | 127.0.0.1       | bind address                               |
+| --port             | 8765            | listen port                                |
+| --token            | ""              | require X-Relay-Token when non-empty       |
+| --command          | print-save      | print-save / save / show / popup / shell   |
+| --save-path        | instructions.md | target; relative → launch directory        |
+| --append           | off             | append with a "---" separator instead      |
+| --max-length       | 200000          | truncate payloads (0 disables)             |
+| --no-debug-payload | off             | skip raw-body logging (see below)          |
+
+HOME = the directory the server was LAUNCHED from: relative --save-path
+resolves against it and debug_payload.jsonl is written there (same home
+model as the Clojure server, §7.4). make run launches from the repo root,
+so its outputs land in the repo root. Install anywhere:
+make install symlinks bin/llm-relay, bin/run-md, bin/run-llm into
+~/.local/bin.
 
 Request handling (POST /send):
 
-1.  Token check (X-Relay-Token) if configured.
+1.  Token check (X-Relay-Token) if --token is set.
 2.  Body: JSON {"text","source"} preferred; a raw text body is accepted.
-3.  Raw body optionally appended to server/debug_payload.jsonl
-    (debug_payload, default true) — the ground truth of what the client
+3.  Raw body optionally appended to HOME/debug_payload.jsonl (default ON;
+    disable with --no-debug-payload) — the ground truth of what the client
     sent, for pipeline diagnosis.
 4.  Trim; empty → 400. Truncate to max_length.
-5.  Dispatch on config command:
-    -   "print-save" (default): print a banner + the text to the console,
-        then save it (see below).
-    -   "save": save only.
-    -   "show": print only.
+5.  Dispatch on --command:
+    -   "print-save" (default): print a banner + the text, then save.
+    -   "save": save only.  "show": print only.
     -   "popup": run a small tkinter window (via python -c) that displays
         the text received on stdin.
     -   anything else: a shell command. If it contains the marker {content},
@@ -226,23 +242,19 @@ Request handling (POST /send):
         command runs with shell=True. Otherwise the text is piped to the
         command's stdin.
 
-Save semantics: target is save_path (default "instructions.md"); RELATIVE
-paths resolve against the PROJECT ROOT (the parent directory of server/),
-absolute paths as-is. Overwrites by default — the file holds the latest
-capture; save_append true appends, separated by a "---" rule.
+Save semantics: overwrites by default — the file holds the latest capture;
+--append appends, separated by a "---" rule.
 
 Execution model: spawn() starts a child without waiting; if text is piped,
 a daemon thread writes stdin and closes it. A slow child can never block
 the HTTP response or other requests.
 
-Example commands (config.json "command"):
+Examples:
 
-    "print-save"                    print + save (default)
-    "show"                          print to console
-    "popup"                         desktop window
-    "pbcopy" / "wl-copy" / "clip"   clipboard (macOS / Wayland / Windows)
-    "cat >> llm_log.txt"            append to file
-    "python my_script.py {content}" pass text as argument
+    llm-relay                                    # defaults: print + save
+    llm-relay --command show                     # console only
+    llm-relay --command "cat >> llm_log.txt"     # shell command (stdin)
+    llm-relay --port 9000 --token s3cret
 
 ## 7. Clojure server (server-clj/)
 
@@ -271,7 +283,7 @@ the runtime config. Default mode on first run: save.
     literally, so the source file contains no fence sequence that markdown
     tooling could misinterpret (lesson learned — see git history).
     The regex anchors fences to the BEGINNING OF A LINE only — fence-like
-    sequences mid-line are treated as plain text (§12.4). tools/run-md.py
+    sequences mid-line are treated as plain text (§12.4). bin/run-md
     implements the same policy for saved files.
 2.  :text segments → fmt-text: headings bold; blockquotes italic/dim;
     bullets (- * +) → •; horizontal rules dimmed; inline code cyan; bold /
@@ -345,18 +357,18 @@ The DEFAULT action on every received message is to persist the text:
 
 ## 8. Configuration reference
 
-server/config.json (Python):
+Python server (bin/llm-relay) — command-line only, no config file:
 
-| key          | default           | meaning                                          |
-|--------------|-------------------|--------------------------------------------------|
-| host         | 127.0.0.1         | bind address                                     |
-| port         | 8765              | listen port                                      |
-| token        | ""                | require X-Relay-Token when non-empty             |
-| command      | "print-save"      | print-save / save / show / popup / shell command |
-| save_path    | "instructions.md" | save target; relative → project root             |
-| save_append  | false             | append with a "---" separator instead            |
-| debug_payload| true              | append raw request bodies to debug_payload.jsonl |
-| max_length   | 200000            | truncate longer payloads (null to disable)       |
+| flag               | default         | meaning                              |
+|--------------------|-----------------|--------------------------------------|
+| --host             | 127.0.0.1       | bind address                         |
+| --port             | 8765            | listen port                          |
+| --token            | ""              | require X-Relay-Token when non-empty |
+| --command          | print-save      | print-save/save/show/popup/shell cmd |
+| --save-path        | instructions.md | relative → launch directory (home)   |
+| --append           | off             | append with a "---" separator        |
+| --max-length       | 200000          | 0 disables truncation                |
+| --no-debug-payload | off             | disable raw-body logging             |
 
 server-clj/config.json (Clojure, local-only):
 
@@ -423,17 +435,18 @@ To customize a language beyond the standard prompt/run flow, add an exact
 
 Change fence handling: keep the LINE-START anchoring consistent across
 server-clj/src/llm_relay/server.clj (split-segments) and
-tools/run-md.py — mid-line fence-like sequences must stay plain text.
+bin/run-md — mid-line fence-like sequences must stay plain text.
 
 ## 11. Development & testing workflow
 
-    make run          # Python server (creates config.json on first run)
+    make run          # Python server (bin/llm-relay; CLI-arg settings)
     make test         # curl POST a test message
     make run-clj      # Clojure server from repo root (home = repo root)
     ./bin/relay-clj   # same server from ANY directory (home = that dir)
+    make install      # symlink llm-relay / run-md / run-llm into ~/.local/bin
     make context      # emit repo state + sources as one paste-able bundle
                       #   (pipe to pbcopy on macOS for LLM-grounded workflows)
-    python3 tools/run-md.py instructions.md
+    ./bin/run-md instructions.md
                       # walk a saved file: renders markdown, asks before
                       # executing each line-anchored bash block
 
@@ -468,7 +481,7 @@ Mode control (Clojure):
     the extension relays the clipboard verbatim. Boring, but the only
     stable public window into the same data the copy button uses.
 4.  FENCE POLICY: fence detection is anchored to the BEGINNING OF A LINE
-    in both the Clojure server (split-segments) and tools/run-md.py.
+    in both the Clojure server (split-segments) and bin/run-md.
     Mid-line fence-like sequences are plain text and can never introduce
     an executable block. Fail-safe direction: a missed fence means
     display-only, never unintended execution.
