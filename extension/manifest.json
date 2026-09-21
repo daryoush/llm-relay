@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "LLM Relay \u2014 send last reply",
+  "name": "LLM Relay \u2014 clipboard to relay",
   "version": "1.3.0",
-  "description": "Grabs the newest assistant reply on ChatGPT, Claude, Gemini, DeepSeek, Kimi, Qwen and z.ai, and POSTs it to your local relay server.",
+  "description": "Relays the clipboard (raw markdown from LLM chat copy buttons, code fences intact) verbatim to your local relay server.",
   "permissions": [
     "storage",
     "contextMenus",
@@ -32,7 +32,7 @@
   },
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Send last LLM reply"
+    "default_title": "Send clipboard to relay server"
   },
   "options_ui": {
     "page": "options.html",

@@ -1,4 +1,4 @@
-.PHONY: run config test
+.PHONY: run config test run-clj context
 
 config:
 	@test -f server/config.json || cp server/config.example.json server/config.json
