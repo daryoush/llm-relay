@@ -17,3 +17,6 @@ server-clj/llm-relay.jar
 server/debug_payload.jsonl
 
 *.cpcache
+
+# chat transcripts / scratch pads — local only
+how-to-synch.md
